@@ -1,0 +1,22 @@
+[2024-10-01T16:30:17.518+0000] {taskinstance.py:1157} INFO - Dependencies all met for dep_context=non-requeueable deps ti=<TaskInstance: third_task_test.compare_and_trigger manual__2024-10-01T16:30:07.552801+00:00 [queued]>
+[2024-10-01T16:30:17.529+0000] {taskinstance.py:1157} INFO - Dependencies all met for dep_context=requeueable deps ti=<TaskInstance: third_task_test.compare_and_trigger manual__2024-10-01T16:30:07.552801+00:00 [queued]>
+[2024-10-01T16:30:17.530+0000] {taskinstance.py:1359} INFO - Starting attempt 1 of 2
+[2024-10-01T16:30:17.558+0000] {taskinstance.py:1380} INFO - Executing <Task(PythonOperator): compare_and_trigger> on 2024-10-01 16:30:07.552801+00:00
+[2024-10-01T16:30:17.574+0000] {standard_task_runner.py:57} INFO - Started process 94 to run task
+[2024-10-01T16:30:17.585+0000] {standard_task_runner.py:84} INFO - Running: ['***', 'tasks', 'run', 'third_task_test', 'compare_and_trigger', 'manual__2024-10-01T16:30:07.552801+00:00', '--job-id', '85', '--raw', '--subdir', 'DAGS_FOLDER/data_fetching_huber_dag.py', '--cfg-path', '/tmp/tmpd45fb4fi']
+[2024-10-01T16:30:17.587+0000] {standard_task_runner.py:85} INFO - Job 85: Subtask compare_and_trigger
+[2024-10-01T16:30:17.684+0000] {task_command.py:415} INFO - Running <TaskInstance: third_task_test.compare_and_trigger manual__2024-10-01T16:30:07.552801+00:00 [running]> on host f6937622df26
+[2024-10-01T16:30:17.867+0000] {taskinstance.py:1660} INFO - Exporting env vars: AIRFLOW_CTX_DAG_OWNER='***' AIRFLOW_CTX_DAG_ID='third_task_test' AIRFLOW_CTX_TASK_ID='compare_and_trigger' AIRFLOW_CTX_EXECUTION_DATE='2024-10-01T16:30:07.552801+00:00' AIRFLOW_CTX_TRY_NUMBER='1' AIRFLOW_CTX_DAG_RUN_ID='manual__2024-10-01T16:30:07.552801+00:00'
+[2024-10-01T16:30:18.129+0000] {taskinstance.py:1935} ERROR - Task failed with exception
+Traceback (most recent call last):
+  File "/home/airflow/.local/lib/python3.8/site-packages/airflow/operators/python.py", line 192, in execute
+    return_value = self.execute_callable()
+  File "/home/airflow/.local/lib/python3.8/site-packages/airflow/operators/python.py", line 209, in execute_callable
+    return self.python_callable(*self.op_args, **self.op_kwargs)
+  File "/opt/airflow/dags/data_fetching_huber_dag.py", line 81, in compare_versions_and_create_trigger
+    raise ValueError(f"bucket_name ({bucket_name}) or s3_key ({s3_key}) not set")
+ValueError: bucket_name (None) or s3_key (None) not set
+[2024-10-01T16:30:18.147+0000] {taskinstance.py:1398} INFO - Marking task as UP_FOR_RETRY. dag_id=third_task_test, task_id=compare_and_trigger, execution_date=20241001T163007, start_date=20241001T163017, end_date=20241001T163018
+[2024-10-01T16:30:18.173+0000] {standard_task_runner.py:104} ERROR - Failed to execute job 85 for task compare_and_trigger (bucket_name (None) or s3_key (None) not set; 94)
+[2024-10-01T16:30:18.281+0000] {local_task_job_runner.py:228} INFO - Task exited with return code 1
+[2024-10-01T16:30:18.335+0000] {taskinstance.py:2776} INFO - 0 downstream tasks scheduled from follow-on schedule check

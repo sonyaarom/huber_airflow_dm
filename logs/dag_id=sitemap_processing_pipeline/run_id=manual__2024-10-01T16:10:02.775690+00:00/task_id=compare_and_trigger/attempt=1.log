@@ -1,0 +1,40 @@
+[2024-10-01T16:10:19.035+0000] {taskinstance.py:1157} INFO - Dependencies all met for dep_context=non-requeueable deps ti=<TaskInstance: sitemap_processing_pipeline.compare_and_trigger manual__2024-10-01T16:10:02.775690+00:00 [queued]>
+[2024-10-01T16:10:19.052+0000] {taskinstance.py:1157} INFO - Dependencies all met for dep_context=requeueable deps ti=<TaskInstance: sitemap_processing_pipeline.compare_and_trigger manual__2024-10-01T16:10:02.775690+00:00 [queued]>
+[2024-10-01T16:10:19.052+0000] {taskinstance.py:1359} INFO - Starting attempt 1 of 2
+[2024-10-01T16:10:19.068+0000] {taskinstance.py:1380} INFO - Executing <Task(PythonOperator): compare_and_trigger> on 2024-10-01 16:10:02.775690+00:00
+[2024-10-01T16:10:19.081+0000] {standard_task_runner.py:57} INFO - Started process 95 to run task
+[2024-10-01T16:10:19.088+0000] {standard_task_runner.py:84} INFO - Running: ['***', 'tasks', 'run', 'sitemap_processing_pipeline', 'compare_and_trigger', 'manual__2024-10-01T16:10:02.775690+00:00', '--job-id', '67', '--raw', '--subdir', 'DAGS_FOLDER/data_fetching_huber_dag.py', '--cfg-path', '/tmp/tmpi_gk5naw']
+[2024-10-01T16:10:19.089+0000] {standard_task_runner.py:85} INFO - Job 67: Subtask compare_and_trigger
+[2024-10-01T16:10:19.159+0000] {task_command.py:415} INFO - Running <TaskInstance: sitemap_processing_pipeline.compare_and_trigger manual__2024-10-01T16:10:02.775690+00:00 [running]> on host f6937622df26
+[2024-10-01T16:10:19.291+0000] {taskinstance.py:1660} INFO - Exporting env vars: AIRFLOW_CTX_DAG_OWNER='***' AIRFLOW_CTX_DAG_ID='sitemap_processing_pipeline' AIRFLOW_CTX_TASK_ID='compare_and_trigger' AIRFLOW_CTX_EXECUTION_DATE='2024-10-01T16:10:02.775690+00:00' AIRFLOW_CTX_TRY_NUMBER='1' AIRFLOW_CTX_DAG_RUN_ID='manual__2024-10-01T16:10:02.775690+00:00'
+[2024-10-01T16:10:19.325+0000] {base.py:73} INFO - Using connection ID 'aws_default' for task execution.
+[2024-10-01T16:10:19.328+0000] {connection_wrapper.py:340} INFO - AWS Connection (conn_id='aws_default', conn_type='aws') credentials retrieved from login and password.
+[2024-10-01T16:10:19.646+0000] {taskinstance.py:1935} ERROR - Task failed with exception
+Traceback (most recent call last):
+  File "/home/airflow/.local/lib/python3.8/site-packages/airflow/operators/python.py", line 192, in execute
+    return_value = self.execute_callable()
+  File "/home/airflow/.local/lib/python3.8/site-packages/airflow/operators/python.py", line 209, in execute_callable
+    return self.python_callable(*self.op_args, **self.op_kwargs)
+  File "/opt/airflow/dags/data_fetching_huber_dag.py", line 141, in compare_versions_and_create_trigger
+    latest_content = s3_hook.read_key(key=s3_key, bucket_name=bucket_name)
+  File "/home/airflow/.local/lib/python3.8/site-packages/airflow/providers/amazon/aws/hooks/s3.py", line 138, in wrapper
+    return func(*bound_args.args, **bound_args.kwargs)
+  File "/home/airflow/.local/lib/python3.8/site-packages/airflow/providers/amazon/aws/hooks/s3.py", line 92, in wrapper
+    return func(*bound_args.args, **bound_args.kwargs)
+  File "/home/airflow/.local/lib/python3.8/site-packages/airflow/providers/amazon/aws/hooks/s3.py", line 940, in read_key
+    obj = self.get_key(key, bucket_name)
+  File "/home/airflow/.local/lib/python3.8/site-packages/airflow/providers/amazon/aws/hooks/s3.py", line 138, in wrapper
+    return func(*bound_args.args, **bound_args.kwargs)
+  File "/home/airflow/.local/lib/python3.8/site-packages/airflow/providers/amazon/aws/hooks/s3.py", line 92, in wrapper
+    return func(*bound_args.args, **bound_args.kwargs)
+  File "/home/airflow/.local/lib/python3.8/site-packages/airflow/providers/amazon/aws/hooks/s3.py", line 923, in get_key
+    obj = s3_resource.Object(bucket_name, key)
+  File "/home/airflow/.local/lib/python3.8/site-packages/boto3/resources/factory.py", line 527, in create_resource
+    return partial(
+  File "/home/airflow/.local/lib/python3.8/site-packages/boto3/resources/base.py", line 125, in __init__
+    raise ValueError(f'Required parameter {identifier} not set')
+ValueError: Required parameter bucket_name not set
+[2024-10-01T16:10:19.669+0000] {taskinstance.py:1398} INFO - Marking task as UP_FOR_RETRY. dag_id=sitemap_processing_pipeline, task_id=compare_and_trigger, execution_date=20241001T161002, start_date=20241001T161019, end_date=20241001T161019
+[2024-10-01T16:10:19.694+0000] {standard_task_runner.py:104} ERROR - Failed to execute job 67 for task compare_and_trigger (Required parameter bucket_name not set; 95)
+[2024-10-01T16:10:19.722+0000] {local_task_job_runner.py:228} INFO - Task exited with return code 1
+[2024-10-01T16:10:19.748+0000] {taskinstance.py:2776} INFO - 0 downstream tasks scheduled from follow-on schedule check

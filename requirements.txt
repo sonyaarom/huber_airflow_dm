@@ -1,0 +1,12 @@
+beautifulsoup4
+boto3
+botocore
+certifi
+charset-normalizer
+idna
+jmespath
+numpy
+pandas
+requests
+sentence-transformers
+urllib3
