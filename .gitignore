@@ -28,6 +28,13 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+*.PyCharm
+*.json
+__pycache__
+__pycache__/
+dags/custom_operators/__pycache__
+dags/data
+.DS_Store
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
