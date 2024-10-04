@@ -29,7 +29,8 @@ def get_pinecone_credentials():
     index_name = Variable.get("PINECONE_INDEX_NAME")
     return api_key, environment, host, index_name
 
-def initialize_pinecone(api_key: str = None, environment: str = None) -> None:
+
+def initialize_pinecone(api_key: str = None, environment: str = None) -> Pinecone:
     logger.info("Initializing Pinecone connection")
     
     api_key = api_key or os.getenv('PINECONE_API_KEY')
@@ -44,8 +45,9 @@ def initialize_pinecone(api_key: str = None, environment: str = None) -> None:
         raise ValueError("Pinecone environment not set")
     
     try:
-        pinecone.init(api_key=api_key, environment=environment)
+        pc = Pinecone(api_key=api_key)
         logger.info("Pinecone connection initialized successfully")
+        return pc
     except Exception as e:
         logger.error(f"Failed to initialize Pinecone: {str(e)}")
         raise
@@ -99,34 +101,75 @@ def format_sparse_vector(sparse_dict: Dict[str, float]) -> Dict[str, List]:
     values = list(sparse_dict.values())
     return {"indices": indices, "values": values}
 
-def upload_to_pinecone_task(**kwargs):
-    api_key, environment, host, index_name = get_pinecone_credentials()
-    
-    logger.info(f"Initializing Pinecone with API key: {api_key[:5]}..., environment: {environment}, host: {host}")
-    
-    pc = Pinecone(api_key=api_key)
-    
-    logger.info(f"Attempting to access index: {index_name}")
-    index = pc.Index(index_name, environment=environment, host=host)
-    
-    try:
-        stats = index.describe_index_stats()
-        logger.info(f"Successfully connected to index. Stats: {stats}")
-    except Exception as e:
-        logger.error(f"Error accessing index: {str(e)}")
-        raise
 
-def upload_to_pinecone(documents: Dict[int, List[Dict[str, Any]]], index_name: str,
-                       project_name: str, metric: str = 'cosine', host : str = None) -> None:
+# def upload_to_pinecone_task(**kwargs):
+#     ti = kwargs['ti']
+#     embeddings_file_paths = ti.xcom_pull(key='embeddings_file_paths', task_ids='recursive_chunking_and_embedding')
+
+#     if not embeddings_file_paths:
+#         raise ValueError("No embeddings file paths received from XCom.")
+
+#     api_key, environment, host, index_name = get_pinecone_credentials()
+    
+#     logger.info(f"Initializing Pinecone with API key: {api_key[:5]}..., environment: {environment}, host: {host}")
+    
+#     pc = initialize_pinecone(api_key, environment)
+    
+#     logger.info(f"Attempting to access index: {index_name}")
+#     index = pc.Index(index_name)
+    
+#     try:
+#         stats = index.describe_index_stats()
+#         logger.info(f"Successfully connected to index. Stats: {stats}")
+#     except Exception as e:
+#         logger.error(f"Error accessing index: {str(e)}")
+#         raise
+
+#     # Get Pinecone configuration from Airflow Variables
+#     project_name = Variable.get("PINECONE_PROJECT_NAME", default_var='huber-chatbot-project')
+#     metric = Variable.get("PINECONE_METRIC", default_var='cosine')
+
+#     for embeddings_file_path in embeddings_file_paths:
+#         logger.info(f"Processing embeddings file: {embeddings_file_path}")
+        
+#         # Load the embeddings data
+#         with open(embeddings_file_path, 'r') as file:
+#             documents = json.load(file)
+        
+#         logger.info(f"Loaded {len(documents)} documents from {embeddings_file_path}")
+
+#         # Prepare documents for upload
+#         chunk_size = 256  # Adjust this if you're using different chunk sizes
+#         documents_dict = {chunk_size: documents}
+
+#         # Upload to Pinecone
+#         upload_to_pinecone(
+#             documents=documents_dict,
+#             index_name=index_name,
+#             project_name=project_name,
+#             metric=metric,
+#             host=host
+#         )
+
+#         logger.info(f"Completed upload for {embeddings_file_path}")
+
+#     logger.info("All uploads completed successfully")
+
+def upload_to_pinecone(api_key: str, documents: Dict[int, List[Dict[str, Any]]], index_name: str,
+                       project_name: str, metric: str = 'cosine', host: str = None) -> None:
     """
     Uploads document embeddings and sparse vectors to an existing Pinecone index.
     """
-    import pinecone  # Ensure pinecone is imported
+    from pinecone import Pinecone  # Import Pinecone class
     logger.info(f"Starting upload process to Pinecone for project {project_name} with metric: {metric}")
+
+    # Initialize Pinecone client
+    pinecone_client = Pinecone(api_key=api_key)
 
     # Access the existing index
     try:
-        index = pinecone.Index(index_name)
+        index = pinecone_client.Index(index_name, host=host)
+        logger.info(f"Successfully accessed index: {index_name}")
     except Exception as e:
         logger.error(f"Error accessing index {index_name}: {str(e)}")
         return

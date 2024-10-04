@@ -1,56 +1,22 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.models import Variable  # For Airflow Variables
+from airflow.hooks.base import BaseHook  # For Airflow Connections
 from datetime import datetime, timedelta
-import sys
 import os
-import boto3
 import json
-import pandas as pd
-import numpy as np
-from sentence_transformers import SentenceTransformer
-from typing import List, Tuple, Any, Dict
-from tqdm import tqdm
-from logging import getLogger
-import gc
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from gliner import GLiNER
-from collections import defaultdict
+import logging
 
-# Import custom functions
-from custom_operators.sitemap_processor import process_sitemap
-from custom_operators.web_utils import add_html_content_to_df
-from custom_operators.content_extractor import add_extracted_content_to_df
-from custom_operators.download_funcs import upload_to_s3
-from custom_operators.shared_utils import apply_bm25_sparse_vectors, embed_dataframe, generate_documents, save_documents_to_json
-
-logger = getLogger(__name__)
-
-# Initialize GLiNER model
-ner_model = GLiNER.from_pretrained("urchade/gliner_small-v2.1")
-labels = ["person", "course", "date", "research_paper", "research_project", "teams", "city", "address", "organisation", "phone_number", "url", "other"]
-
-def get_overlap(chunk_size: int) -> int:
-    return 50 if chunk_size <= 256 else 200
-
-def convert_entities_to_label_name_dict(entities: List[Dict[str, Any]]) -> Dict[str, List[str]]:
-    label_name_dict = defaultdict(set)
-    for entity in entities:
-        text = entity['text'].strip().lower()
-        label_name_dict[entity['label']].add(text)
-    return {k: list(v) for k, v in label_name_dict.items()}
-
-# Import custom functions
-from custom_operators.sitemap_processor import process_sitemap
-from custom_operators.web_utils import add_html_content_to_df
-from custom_operators.content_extractor import add_extracted_content_to_df
-
+# Initialize logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Constants
 BUCKET_NAME = 'huber-chatbot-project'
 S3_KEY_PREFIX = f'sitemap_data/sitemap_data_{datetime.now().strftime("%Y")}.json'
 ENRICHED_DATA_DIR = '/opt/airflow/dags/enriched'
 
+# Airflow default arguments
 default_args = {
     'owner': 'airflow',
     'depends_on_past': False,
@@ -61,6 +27,7 @@ default_args = {
     'retry_delay': timedelta(minutes=5),
 }
 
+# DAG definition
 dag = DAG(
     'sitemap_retrieval_and_enrichment',
     default_args=default_args,
@@ -70,34 +37,38 @@ dag = DAG(
 )
 
 def process_sitemap_task(**kwargs):
+    from custom_operators.sitemap_processor import process_sitemap
+
     url = 'https://www.wiwi.hu-berlin.de/sitemap.xml.gz'
     exclude_extensions = ['.jpg', '.pdf', '.jpeg', '.png']
     exclude_patterns = ['view']
     include_patterns = ['/en/']
     allowed_base_url = 'https://www.wiwi.hu-berlin.de'
-    
+
     data_dict, total, filtered, safe, unsafe = process_sitemap(
         url, exclude_extensions, exclude_patterns, include_patterns, allowed_base_url
     )
-    
+
     logger.info(f"Total entries: {total}")
     logger.info(f"Filtered entries: {filtered}")
     logger.info(f"Safe entries: {safe}")
     logger.info(f"Unsafe entries: {unsafe}")
-    
-    # Pass the data_dict to the next task
-    kwargs['ti'].xcom_push(key='data_dict', value=data_dict)
-    return data_dict
+
+    # Save the data_dict to a JSON file and pass the file path
+    os.makedirs('/opt/airflow/dags/data', exist_ok=True)
+    data_file_path = '/opt/airflow/dags/data/sitemap_data.json'
+    with open(data_file_path, 'w') as f:
+        json.dump(data_dict, f)
+    kwargs['ti'].xcom_push(key='data_file_path', value=data_file_path)
 
 def upload_to_s3_task(**kwargs):
+    from airflow.hooks.S3_hook import S3Hook  # Moved inside the function
     ti = kwargs['ti']
-    data_dict = ti.xcom_pull(key='data_dict', task_ids='process_sitemap')
-    
-    json_data = json.dumps(data_dict)
-    
+    data_file_path = ti.xcom_pull(key='data_file_path', task_ids='process_sitemap')
+
     s3_hook = S3Hook(aws_conn_id='aws_default')
-    s3_hook.load_string(
-        string_data=json_data,
+    s3_hook.load_file(
+        filename=data_file_path,
         key=S3_KEY_PREFIX,
         bucket_name=BUCKET_NAME,
         replace=True
@@ -106,56 +77,109 @@ def upload_to_s3_task(**kwargs):
     logger.info(f"S3 key: {S3_KEY_PREFIX}")
 
 def enrich_data_task(**kwargs):
+    import pandas as pd  # Moved inside the function
     ti = kwargs['ti']
-    data_dict = ti.xcom_pull(key='data_dict', task_ids='process_sitemap')
-    
+    data_file_path = ti.xcom_pull(key='data_file_path', task_ids='process_sitemap')
+
+    # Load the data
+    with open(data_file_path, 'r') as f:
+        data_dict = json.load(f)
+
     # Process the data
     df = pd.DataFrame.from_dict(data_dict, orient='index').reset_index()
     df.columns = ['id', 'url', 'last_updated']
-    
-    # Take a sample for testing (remove this line for full processing)
-    df = df.head(5)
-    
+
+    df = df.head(10)
+
+    # Import inside the function
+    from custom_operators.web_utils import add_html_content_to_df
+    from custom_operators.content_extractor import add_extracted_content_to_df
+
     # Add HTML content to the DataFrame
     df = add_html_content_to_df(df)
-    
+
+    # Log number of None html_content entries
+    num_none_html = df['html_content'].isnull().sum()
+    logger.info(f"Number of entries with None html_content: {num_none_html}")
+
     # Extract and add content to the DataFrame
     df = add_extracted_content_to_df(df)
-    
-    # Display results
-    logger.info(df[['url', 'extracted_title', 'extracted_content']])
-    
+
+    # Optionally, drop rows with missing extracted content
+    df = df[df['extracted_content'] != "Title not found Main content not found"]
+
     # Save enriched data locally
     os.makedirs(ENRICHED_DATA_DIR, exist_ok=True)
-    enriched_file_path = os.path.join(ENRICHED_DATA_DIR, f'enriched_data_{datetime.now().strftime("%Y%m%d")}.csv')
+    enriched_file_path = os.path.join(
+        ENRICHED_DATA_DIR, f'enriched_data_{datetime.now().strftime("%Y%m%d")}.csv')
     df.to_csv(enriched_file_path, index=False)
     logger.info(f"Enriched data saved to: {enriched_file_path}")
 
+    # Push the enriched file path to XCom
+    ti.xcom_push(key='enriched_file_path', value=enriched_file_path)
 
 def recursive_chunking_and_embedding_task(**kwargs):
+    import pandas as pd
+    import numpy as np
+    import os
+    import gc
+    from collections import defaultdict
+    from tqdm import tqdm
+    from sentence_transformers import SentenceTransformer
+    import json  # Added import for JSON handling
+
+    # Import custom functions
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+    from custom_operators.shared_utils import (
+        apply_bm25_sparse_vectors,
+        embed_dataframe,
+        generate_documents,
+        save_documents_to_json,
+        create_and_save_bm25_corpus
+    )
+
+    # Retrieve the task instance to use XCom
     ti = kwargs['ti']
-    df = ti.xcom_pull(key='processed_df', task_ids='process_data')
-    
-    chunk_lengths = [256]  # You can adjust these as needed
+    enriched_file_path = ti.xcom_pull(key='enriched_file_path', task_ids='enrich_data')
+
+    logger.info(f"Loading enriched data from: {enriched_file_path}")
+
+    # Read the DataFrame from the CSV file
+    df = pd.read_csv(enriched_file_path)
+
+    # Initialize models inside the function
     embed_model = SentenceTransformer('all-MiniLM-L6-v2', trust_remote_code=True)
     embed_model_name = 'all-MiniLM-L6-v2'
+
+    # Define base paths
     base_path = '/opt/airflow/dags/embeddings'
-    
-    # Initialize BM25 (you might need to adjust this based on your shared_utils implementation)
-    bm25_values = {}  # This should be initialized properly based on your implementation
-    
-    chunk_stats = process_data_recursive_langchain(df, chunk_lengths, embed_model, embed_model_name, base_path, bm25_values)
-    
-    # Log chunk statistics
-    for stat in chunk_stats:
-        logger.info(f"Chunk length {stat[0]}: min={stat[1]}, max={stat[2]}, mean={stat[3]:.2f}, median={stat[4]:.2f}")
+    main_file = '/opt/airflow/dags/complete_files'
 
-def process_data_recursive_langchain(df: pd.DataFrame, chunk_lengths: List[int], embed_model: Any, embed_model_name: str, base_path: str, bm25_values: dict) -> List[Tuple[int, int, int, float, float]]:
+    # Ensure the directories exist
+    os.makedirs(base_path, exist_ok=True)
+    os.makedirs(main_file, exist_ok=True)
+
+    chunk_lengths = [256]  # Adjust as needed
+    doc_type = 'recursive'  # Set doc_type to match your use case
+
+    # Create or load BM25 values
+    bm25_file_path = os.path.join(base_path, 'bm25_values.json')
+    if not os.path.exists(bm25_file_path):
+        logger.info(f"Creating BM25 corpus at: {bm25_file_path}")
+        bm25_values = create_and_save_bm25_corpus(df, 'extracted_content', bm25_file_path)
+    else:
+        logger.info(f"Loading BM25 corpus from: {bm25_file_path}")
+        with open(bm25_file_path, 'r') as f:
+            bm25_values = json.load(f)
+
+    # List to hold embeddings file paths
+    embeddings_file_paths = []
+
+    # Process data for each chunk length
     chunk_stats = []
-
     for chunk_length in chunk_lengths:
         logger.info(f"Processing recursive chunks with max length: {chunk_length}")
-        
+
         text_splitter = RecursiveCharacterTextSplitter(
             chunk_size=chunk_length,
             chunk_overlap=get_overlap(chunk_length),
@@ -169,21 +193,20 @@ def process_data_recursive_langchain(df: pd.DataFrame, chunk_lengths: List[int],
         urls = []
         last_updateds = []
         html_contents = []
-        entities = []
 
-        for _, row in tqdm(df.iterrows(), total=len(df), desc="Chunking texts"):
-            if isinstance(row['text'], str):
-                chunks = text_splitter.split_text(row['text'])
+        # Chunk the texts
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Chunking texts"):
+            text = row.get('extracted_content', '')
+            if isinstance(text, str):
+                chunks = text_splitter.split_text(text)
                 all_chunks.extend(chunks)
                 unique_ids.extend([f"{row['id']}_{i+1}" for i in range(len(chunks))])
                 general_ids.extend([row['id']] * len(chunks))
                 urls.extend([row['url']] * len(chunks))
                 last_updateds.extend([row.get('last_updated', '')] * len(chunks))
                 html_contents.extend([row.get('html_content', '')] * len(chunks))
-                
-                chunk_entities = [convert_entities_to_label_name_dict(ner_model.predict_entities(chunk, labels)) for chunk in chunks]
-                entities.extend(chunk_entities)
 
+        # Create a DataFrame for the chunks
         chunked_df = pd.DataFrame({
             'unique_id': unique_ids,
             'url': urls,
@@ -192,13 +215,18 @@ def process_data_recursive_langchain(df: pd.DataFrame, chunk_lengths: List[int],
             'text': all_chunks,
             'len': [len(chunk) for chunk in all_chunks],
             'general_id': general_ids,
-            'entities': entities
         })
 
+        # Filter out short chunks
         chunked_df = chunked_df[chunked_df['len'] >= 50]
 
         logger.info(f"Created {len(chunked_df)} chunks")
 
+        if len(chunked_df) == 0:
+            logger.warning(f"No chunks created for chunk_length {chunk_length}. Skipping.")
+            continue
+
+        # Compute statistics
         min_length = chunked_df['len'].min()
         max_length = chunked_df['len'].max()
         mean_length = chunked_df['len'].mean()
@@ -211,26 +239,108 @@ def process_data_recursive_langchain(df: pd.DataFrame, chunk_lengths: List[int],
         logger.info(f"  Mean length: {mean_length:.2f}")
         logger.info(f"  Median length: {median_length:.2f}")
 
+        # Apply BM25 sparse vectorization
         logger.info("Applying BM25 sparse vectorization")
-        chunked_df = apply_bm25_sparse_vectors(chunked_df, 'text', bm25_values)
+        try:
+            chunked_df = apply_bm25_sparse_vectors(chunked_df, 'text', bm25_values)
+        except Exception as e:
+            logger.error(f"Error applying BM25 sparse vectors: {str(e)}")
+            continue
 
+        # Embed the chunked texts
         logger.info("Embedding chunked texts")
         embedded_df = embed_dataframe(chunked_df, embed_model)
 
+        # Generate document dictionaries
         logger.info("Generating document dictionaries")
-        documents = generate_documents(embedded_df, chunk_length, 'recursive')
+        documents = generate_documents(embedded_df, chunk_length, doc_type)
 
+        # Save documents to JSON
         logger.info("Saving documents to JSON")
-        save_documents_to_json(documents, chunk_length, embed_model_name, 'recursive', base_path)
+        save_documents_to_json(documents, chunk_length, embed_model_name, doc_type, base_path)
 
+        # Construct the embeddings file name using the same logic as save_documents_to_json
+        filename = f"{doc_type}-vectors-{chunk_length}chunksize-{embed_model_name}-sparse.json"
+        embeddings_file_path = os.path.join(base_path, filename)
+        logger.info(f"Embeddings file saved to: {embeddings_file_path}")
+
+        # Append the embeddings file path to the list
+        embeddings_file_paths.append(embeddings_file_path)
+
+        # Clean up to free memory
         del chunked_df, embedded_df, documents
         gc.collect()
 
         logger.info(f"Finished processing chunks of max length {chunk_length}.")
 
+    # Push the embeddings file paths to XCom for the next task
+    ti.xcom_push(key='embeddings_file_paths', value=embeddings_file_paths)
+    logger.info(f"Embeddings file paths pushed to XCom: {embeddings_file_paths}")
+
+    # Optionally, return the chunk statistics
     return chunk_stats
 
 
+
+def get_overlap(chunk_size: int) -> int:
+    return 50 if chunk_size <= 256 else 200
+
+
+def upload_to_pinecone_task(**kwargs):
+    from custom_operators.pinecone_func import upload_to_pinecone, get_pinecone_credentials, initialize_pinecone
+    ti = kwargs['ti']
+    embeddings_file_paths = ti.xcom_pull(key='embeddings_file_paths', task_ids='recursive_chunking_and_embedding')
+
+    if not embeddings_file_paths:
+        raise ValueError("No embeddings file paths received from XCom.")
+
+    api_key, environment, host, index_name = get_pinecone_credentials()
+    
+    logger.info(f"Initializing Pinecone with API key: {api_key[:5]}..., environment: {environment}, host: {host}")
+    
+    pc = initialize_pinecone(api_key, environment)
+    
+    logger.info(f"Attempting to access index: {index_name}")
+    index = pc.Index(index_name, host=host)  # Pass the host parameter here
+    
+    try:
+        stats = index.describe_index_stats()
+        logger.info(f"Successfully connected to index. Stats: {stats}")
+    except Exception as e:
+        logger.error(f"Error accessing index: {str(e)}")
+        raise
+
+    # Get Pinecone configuration from Airflow Variables
+    project_name = Variable.get("PINECONE_PROJECT_NAME", default_var='huber-chatbot-project')
+    metric = Variable.get("PINECONE_METRIC", default_var='cosine')
+
+    for embeddings_file_path in embeddings_file_paths:
+        logger.info(f"Processing embeddings file: {embeddings_file_path}")
+        
+        # Load the embeddings data
+        with open(embeddings_file_path, 'r') as file:
+            documents = json.load(file)
+        
+        logger.info(f"Loaded {len(documents)} documents from {embeddings_file_path}")
+
+        # Prepare documents for upload
+        chunk_size = 256  # Adjust this if you're using different chunk sizes
+        documents_dict = {chunk_size: documents}
+
+        # Upload to Pinecone
+        upload_to_pinecone(
+            api_key=api_key,
+            documents=documents_dict,
+            index_name=index_name,
+            project_name=project_name,
+            metric=metric,
+            host=host
+        )
+
+        logger.info(f"Completed upload for {embeddings_file_path}")
+
+    logger.info("All uploads completed successfully")
+# Define the tasks
 t1 = PythonOperator(
     task_id='process_sitemap',
     python_callable=process_sitemap_task,
@@ -259,7 +369,12 @@ t4 = PythonOperator(
     dag=dag,
 )
 
-
+t5 = PythonOperator(
+    task_id='upload_to_pinecone',
+    python_callable=upload_to_pinecone_task,
+    provide_context=True,
+    dag=dag,
+)
 
 # Set the task dependencies
-t1 >> t2 >> t3 >> t4
+t1 >> t2 >> t3 >> t4 >> t5
