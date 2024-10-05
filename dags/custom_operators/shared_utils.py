@@ -139,6 +139,16 @@ def apply_bm25_sparse_vectors(df: pd.DataFrame, text_column: str, bm25_values: d
     Returns:
         pd.DataFrame: DataFrame with added 'bm25_sparse_vector' column.
     """
+    if not isinstance(bm25_values, dict):
+        raise ValueError(f"bm25_values must be a dictionary, got {type(bm25_values)}")
+
+    if "vocabulary" not in bm25_values:
+        logger.warning("'vocabulary' key not found in bm25_values. Creating vocabulary from the data.")
+        vocabulary = set()
+        for doc in df[text_column]:
+            vocabulary.update(doc.lower().split())
+        bm25_values["vocabulary"] = list(vocabulary)
+
     vocab = {word: i for i, word in enumerate(bm25_values["vocabulary"])}
 
     def get_bm25_sparse_vector(doc):
@@ -146,11 +156,11 @@ def apply_bm25_sparse_vectors(df: pd.DataFrame, text_column: str, bm25_values: d
         vector = {}
         doc_len = len(doc.split())
         for term in doc_terms:
-            if term in vocab and term in bm25_values["idf"]:
+            if term in vocab and term in bm25_values.get("idf", {}):
                 idf = bm25_values["idf"][term]
                 tf = doc_terms[term]
-                numerator = tf * (bm25_values["k1"] + 1)
-                denominator = tf + bm25_values["k1"] * (1 - bm25_values["b"] + bm25_values["b"] * doc_len / bm25_values["avgdl"])
+                numerator = tf * (bm25_values.get("k1", 1.5) + 1)
+                denominator = tf + bm25_values.get("k1", 1.5) * (1 - bm25_values.get("b", 0.75) + bm25_values.get("b", 0.75) * doc_len / bm25_values.get("avgdl", 1))
                 score = idf * (numerator / denominator)
                 vector[vocab[term]] = float(score)
         return vector

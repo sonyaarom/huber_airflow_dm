@@ -14,7 +14,12 @@ logger = logging.getLogger(__name__)
 # Constants
 BUCKET_NAME = 'huber-chatbot-project'
 S3_KEY_PREFIX = f'sitemap_data/sitemap_data_{datetime.now().strftime("%Y")}.json'
+ENRICHED_DATA_S3_PREFIX = f'enriched_data/enriched_data_{datetime.now().strftime("%Y%m")}.csv'
+EMBEDDINGS_S3_PREFIX = 'embeddings/'
+BM25_S3_PREFIX = 'bm25/'
 ENRICHED_DATA_DIR = '/opt/airflow/dags/enriched'
+EMBEDDINGS_DIR = '/opt/airflow/dags/embeddings'
+BM25_DIR = '/opt/airflow/dags/bm25'
 
 # Airflow default arguments
 default_args = {
@@ -61,8 +66,9 @@ def process_sitemap_task(**kwargs):
         json.dump(data_dict, f)
     kwargs['ti'].xcom_push(key='data_file_path', value=data_file_path)
 
+
 def upload_to_s3_task(**kwargs):
-    from airflow.hooks.S3_hook import S3Hook  # Moved inside the function
+    from airflow.hooks.S3_hook import S3Hook
     ti = kwargs['ti']
     data_file_path = ti.xcom_pull(key='data_file_path', task_ids='process_sitemap')
 
@@ -111,12 +117,29 @@ def enrich_data_task(**kwargs):
     # Save enriched data locally
     os.makedirs(ENRICHED_DATA_DIR, exist_ok=True)
     enriched_file_path = os.path.join(
-        ENRICHED_DATA_DIR, f'enriched_data_{datetime.now().strftime("%Y%m%d")}.csv')
+        ENRICHED_DATA_DIR, f'enriched_data_{datetime.now().strftime("%Y%m")}.csv')
     df.to_csv(enriched_file_path, index=False)
     logger.info(f"Enriched data saved to: {enriched_file_path}")
-
-    # Push the enriched file path to XCom
+    #push the enriched file path to xcom
+    ti = kwargs['ti']
     ti.xcom_push(key='enriched_file_path', value=enriched_file_path)
+
+def upload_enriched_data_to_s3_task(**kwargs):
+    from airflow.hooks.S3_hook import S3Hook
+    ti = kwargs['ti']
+    enriched_file_path = ti.xcom_pull(key='enriched_file_path', task_ids='enrich_data')
+
+    s3_hook = S3Hook(aws_conn_id='aws_default')
+    s3_hook.load_file(
+        filename=enriched_file_path,
+        key=ENRICHED_DATA_S3_PREFIX,
+        bucket_name=BUCKET_NAME,
+        replace=True
+    )
+    logger.info(f"Enriched data uploaded to S3 bucket: {BUCKET_NAME}")
+    logger.info(f"S3 key: {ENRICHED_DATA_S3_PREFIX}")
+    
+
 
 def recursive_chunking_and_embedding_task(**kwargs):
     import pandas as pd
@@ -162,8 +185,10 @@ def recursive_chunking_and_embedding_task(**kwargs):
     chunk_lengths = [256]  # Adjust as needed
     doc_type = 'recursive'  # Set doc_type to match your use case
 
-    # Create or load BM25 values
-    bm25_file_path = os.path.join(base_path, 'bm25_values.json')
+    # Create BM25 directory if it doesn't exist
+    os.makedirs(BM25_DIR, exist_ok=True)
+
+    bm25_file_path = os.path.join(BM25_DIR, 'bm25_values.json')
     if not os.path.exists(bm25_file_path):
         logger.info(f"Creating BM25 corpus at: {bm25_file_path}")
         bm25_values = create_and_save_bm25_corpus(df, 'extracted_content', bm25_file_path)
@@ -281,6 +306,39 @@ def recursive_chunking_and_embedding_task(**kwargs):
     return chunk_stats
 
 
+def upload_embeddings_to_s3_task(**kwargs):
+    from airflow.hooks.S3_hook import S3Hook
+    ti = kwargs['ti']
+    embeddings_file_paths = ti.xcom_pull(key='embeddings_file_paths', task_ids='recursive_chunking_and_embedding')
+
+    s3_hook = S3Hook(aws_conn_id='aws_default')
+    for file_path in embeddings_file_paths:
+        file_name = os.path.basename(file_path)
+        s3_key = f"{EMBEDDINGS_S3_PREFIX}{file_name}"
+        s3_hook.load_file(
+            filename=file_path,
+            key=s3_key,
+            bucket_name=BUCKET_NAME,
+            replace=True
+        )
+        logger.info(f"Embeddings file uploaded to S3 bucket: {BUCKET_NAME}")
+        logger.info(f"S3 key: {s3_key}")
+
+def upload_bm25_to_s3_task(**kwargs):
+    from airflow.hooks.S3_hook import S3Hook
+    bm25_file_path = os.path.join(BM25_DIR, 'bm25_values.json')
+
+    s3_hook = S3Hook(aws_conn_id='aws_default')
+    s3_key = f"{BM25_S3_PREFIX}bm25_values.json"
+    s3_hook.load_file(
+        filename=bm25_file_path,
+        key=s3_key,
+        bucket_name=BUCKET_NAME,
+        replace=True
+    )
+    logger.info(f"BM25 file uploaded to S3 bucket: {BUCKET_NAME}")
+    logger.info(f"S3 key: {s3_key}")
+
 
 def get_overlap(chunk_size: int) -> int:
     return 50 if chunk_size <= 256 else 200
@@ -340,6 +398,7 @@ def upload_to_pinecone_task(**kwargs):
         logger.info(f"Completed upload for {embeddings_file_path}")
 
     logger.info("All uploads completed successfully")
+
 # Define the tasks
 t1 = PythonOperator(
     task_id='process_sitemap',
@@ -363,13 +422,34 @@ t3 = PythonOperator(
 )
 
 t4 = PythonOperator(
+    task_id='upload_enriched_data_to_s3',
+    python_callable=upload_enriched_data_to_s3_task,
+    provide_context=True,
+    dag=dag,
+)
+
+t5 = PythonOperator(
     task_id='recursive_chunking_and_embedding',
     python_callable=recursive_chunking_and_embedding_task,
     provide_context=True,
     dag=dag,
 )
 
-t5 = PythonOperator(
+t6 = PythonOperator(
+    task_id='upload_embeddings_to_s3',
+    python_callable=upload_embeddings_to_s3_task,
+    provide_context=True,
+    dag=dag,
+)
+
+t7 = PythonOperator(
+    task_id='upload_bm25_to_s3',
+    python_callable=upload_bm25_to_s3_task,
+    provide_context=True,
+    dag=dag,
+)
+
+t8 = PythonOperator(
     task_id='upload_to_pinecone',
     python_callable=upload_to_pinecone_task,
     provide_context=True,
@@ -377,4 +457,4 @@ t5 = PythonOperator(
 )
 
 # Set the task dependencies
-t1 >> t2 >> t3 >> t4 >> t5
+t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8

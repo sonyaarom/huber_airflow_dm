@@ -3,6 +3,13 @@ import re
 import pandas as pd
 
 def extract_info(html_content):
+    if not html_content:
+        # Handle None or empty html_content
+        return {
+            "title": "Title not found",
+            "content": "Main content not found"
+        }
+    
     soup = BeautifulSoup(html_content, 'html.parser')
     
     # Extract title
