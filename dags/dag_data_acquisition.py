@@ -42,56 +42,55 @@ default_args = {
 
 # Create the DAG
 dag = DAG(
-    'sitemap_processing_pipeline',
+    'sitemap_update_pipeline_old',
     default_args=default_args,
     description='A DAG for processing sitemaps and extracting content',
     schedule_interval='@monthly',  # Run monthly
     catchup=False
 )
 
-# Define the tasks
+#Get the sitemap data from the sitemap.xml.gz file
+
 def process_sitemap_task(**kwargs):
+    from custom_operators.sitemap_processor import process_sitemap
+
     url = 'https://www.wiwi.hu-berlin.de/sitemap.xml.gz'
     exclude_extensions = ['.jpg', '.pdf', '.jpeg', '.png']
     exclude_patterns = ['view']
     include_patterns = ['/en/']
     allowed_base_url = 'https://www.wiwi.hu-berlin.de'
-    
+
     data_dict, total, filtered, safe, unsafe = process_sitemap(
         url, exclude_extensions, exclude_patterns, include_patterns, allowed_base_url
     )
-    
-    print(f"Total entries: {total}")
-    print(f"Filtered entries: {filtered}")
-    print(f"Safe entries: {safe}")
-    print(f"Unsafe entries: {unsafe}")
-    
-    # Pass the data_dict to the next task
-    kwargs['ti'].xcom_push(key='data_dict', value=data_dict)
-    return data_dict
+
+    logger.info(f"Total entries: {total}")
+    logger.info(f"Filtered entries: {filtered}")
+    logger.info(f"Safe entries: {safe}")
+    logger.info(f"Unsafe entries: {unsafe}")
+
+    # Save the data_dict to a JSON file and pass the file path
+    os.makedirs(SITEMAP_DATA_DIR, exist_ok=True)
+    data_file_path = os.path.join(SITEMAP_DATA_DIR, 'sitemap_data.json')
+    with open(data_file_path, 'w') as f:
+        json.dump(data_dict, f)
+    kwargs['ti'].xcom_push(key='data_file_path', value=data_file_path)
+
 
 def upload_to_s3_task(**kwargs):
+    from airflow.hooks.S3_hook import S3Hook
     ti = kwargs['ti']
-    data_dict = ti.xcom_pull(key='data_dict', task_ids='process_sitemap')
-    
-    bucket_name = 'huber-chatbot-project'
-    s3_key_prefix = f'sitemap_data/sitemap_data_{datetime.now().strftime("%Y")}.json'
-    
-    json_data = json.dumps(data_dict)
-    
+    data_file_path = ti.xcom_pull(key='data_file_path', task_ids='process_sitemap')
+
     s3_hook = S3Hook(aws_conn_id='aws_default')
-    s3_hook.load_string(
-        string_data=json_data,
-        key=s3_key_prefix,
-        bucket_name=bucket_name,
+    s3_hook.load_file(
+        filename=data_file_path,
+        key=S3_KEY_PREFIX,
+        bucket_name=BUCKET_NAME,
         replace=True
     )
-    print(f"Data uploaded to S3 bucket: {bucket_name}")
-    print(f"S3 key: {s3_key_prefix}")
-    
-    # Pass the bucket name and key to the next task
-    ti.xcom_push(key='bucket_name', value=bucket_name)
-    ti.xcom_push(key='s3_key', value=s3_key_prefix)
+    logger.info(f"Data uploaded to S3 bucket: {BUCKET_NAME}")
+    logger.info(f"S3 key: {S3_KEY_PREFIX}")
 
 
 def process_data_task(**kwargs):

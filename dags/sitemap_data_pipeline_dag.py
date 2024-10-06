@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import os
 import json
 import logging
+import shutil
 
 # Initialize logger
 logging.basicConfig(level=logging.INFO)
@@ -13,13 +14,18 @@ logger = logging.getLogger(__name__)
 
 # Constants
 BUCKET_NAME = 'huber-chatbot-project'
+SITEMAP_DATA_DIR = '/opt/airflow/dags/data'
 S3_KEY_PREFIX = f'sitemap_data/sitemap_data_{datetime.now().strftime("%Y")}.json'
-ENRICHED_DATA_S3_PREFIX = f'enriched_data/enriched_data_{datetime.now().strftime("%Y%m")}.csv'
+ENRICHED_DATA_S3_PREFIX = f'enriched_data/enriched_data_{datetime.now().strftime("%Y")}.csv'
 EMBEDDINGS_S3_PREFIX = 'embeddings/'
 BM25_S3_PREFIX = 'bm25/'
 ENRICHED_DATA_DIR = '/opt/airflow/dags/enriched'
 EMBEDDINGS_DIR = '/opt/airflow/dags/embeddings'
 BM25_DIR = '/opt/airflow/dags/bm25'
+UNIQUE_IDS_S3_PREFIX = 'unique_ids/'
+UNIQUE_IDS_DIR = '/opt/airflow/dags/unique_ids'
+
+
 
 # Airflow default arguments
 default_args = {
@@ -41,6 +47,7 @@ dag = DAG(
     catchup=False
 )
 
+
 def process_sitemap_task(**kwargs):
     from custom_operators.sitemap_processor import process_sitemap
 
@@ -60,11 +67,12 @@ def process_sitemap_task(**kwargs):
     logger.info(f"Unsafe entries: {unsafe}")
 
     # Save the data_dict to a JSON file and pass the file path
-    os.makedirs('/opt/airflow/dags/data', exist_ok=True)
-    data_file_path = '/opt/airflow/dags/data/sitemap_data.json'
+    os.makedirs(SITEMAP_DATA_DIR, exist_ok=True)
+    data_file_path = os.path.join(SITEMAP_DATA_DIR, 'sitemap_data.json')
     with open(data_file_path, 'w') as f:
         json.dump(data_dict, f)
     kwargs['ti'].xcom_push(key='data_file_path', value=data_file_path)
+
 
 
 def upload_to_s3_task(**kwargs):
@@ -180,7 +188,6 @@ def recursive_chunking_and_embedding_task(**kwargs):
 
     # Ensure the directories exist
     os.makedirs(base_path, exist_ok=True)
-    os.makedirs(main_file, exist_ok=True)
 
     chunk_lengths = [256]  # Adjust as needed
     doc_type = 'recursive'  # Set doc_type to match your use case
@@ -399,6 +406,57 @@ def upload_to_pinecone_task(**kwargs):
 
     logger.info("All uploads completed successfully")
 
+def extract_and_upload_unique_ids_task(**kwargs):
+    """Extract unique IDs from embedding files and upload to S3."""
+    from airflow.hooks.S3_hook import S3Hook
+    ti = kwargs['ti']
+    embeddings_file_paths = ti.xcom_pull(key='embeddings_file_paths', task_ids='recursive_chunking_and_embedding')
+
+    all_unique_ids = set()
+
+    for file_path in embeddings_file_paths:
+        with open(file_path, 'r') as f:
+            data = json.load(f)
+            for item in data:
+                all_unique_ids.add(item['unique_id'])
+
+    # Ensure the unique IDs directory exists
+    os.makedirs(UNIQUE_IDS_DIR, exist_ok=True)
+    unique_ids_file_path = os.path.join(UNIQUE_IDS_DIR, 'unique_ids.json')
+
+    # Save unique IDs locally
+    with open(unique_ids_file_path, 'w') as f:
+        json.dump(list(all_unique_ids), f)
+
+    # Upload to S3
+    s3_hook = S3Hook(aws_conn_id='aws_default')
+    s3_key = f"{UNIQUE_IDS_S3_PREFIX}unique_ids.json"
+    s3_hook.load_file(
+        filename=unique_ids_file_path,
+        key=s3_key,
+        bucket_name=BUCKET_NAME,
+        replace=True
+    )
+    logger.info(f"Unique IDs file uploaded to S3 bucket: {BUCKET_NAME}")
+    logger.info(f"S3 key: {s3_key}")
+
+    # Delete the local unique IDs file
+    os.remove(unique_ids_file_path)
+    logger.info(f"Deleted local unique IDs file: {unique_ids_file_path}")
+
+
+def cleanup_local_files_task(**kwargs):
+    """Delete locally stored BM25, embeddings, and enriched files after S3 upload."""
+    directories_to_clean = [SITEMAP_DATA_DIR, ENRICHED_DATA_DIR, EMBEDDINGS_DIR, BM25_DIR, UNIQUE_IDS_DIR]
+    
+    for directory in directories_to_clean:
+        if os.path.exists(directory):
+            shutil.rmtree(directory)
+            logger.info(f"Deleted directory: {directory}")
+        else:
+            logger.info(f"Directory does not exist: {directory}")
+
+
 # Define the tasks
 t1 = PythonOperator(
     task_id='process_sitemap',
@@ -456,5 +514,18 @@ t8 = PythonOperator(
     dag=dag,
 )
 
+t9 = PythonOperator(
+    task_id='extract_and_upload_unique_ids',
+    python_callable=extract_and_upload_unique_ids_task,
+    provide_context=True,
+    dag=dag,
+)
+
+t10 = PythonOperator(
+    task_id='cleanup_local_files',
+    python_callable=cleanup_local_files_task,
+    provide_context=True,
+    dag=dag,
+)
 # Set the task dependencies
-t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8
+t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8 >> t9 >> t10
