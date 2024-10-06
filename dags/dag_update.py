@@ -1,8 +1,11 @@
 from airflow import DAG
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
 from airflow.hooks.base import BaseHook
+from airflow.models import Variable
 from airflow.utils.trigger_rule import TriggerRule
+from requests.exceptions import RequestException
 from botocore.exceptions import ClientError
 from datetime import datetime, timedelta
 import json
@@ -14,14 +17,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Constants
-TRIGGER_DIRECTORY = '/opt/airflow/dags/triggers'
+TRIGGER_FILE_PREFIX = 'triggers/'
 BUCKET_NAME = 'huber-chatbot-project'
 FILE_PATH = 'sitemap_data/sitemap_data_2024.json'
 
 # Telegram setup
-telegram_conn = BaseHook.get_connection("telegram_default")
-TELEGRAM_BOT_TOKEN = telegram_conn.password
-TELEGRAM_CHAT_ID = telegram_conn.login
+TELEGRAM_BOT_TOKEN = Variable.get("TELEGRAM_BOT_TOKEN", default_var=None)
+TELEGRAM_CHAT_ID = Variable.get("TELEGRAM_CHAT_ID", default_var=None)
+
 
 # DAG definition
 default_args = {
@@ -65,28 +68,38 @@ def get_changes(old_content, new_content):
     added = {k: v for k, v in new_content.items() if k not in old_content}
     return removed, delta, added
 
-def create_trigger_file(removed, delta, added):
-    os.makedirs(TRIGGER_DIRECTORY, exist_ok=True)
+
+def create_trigger_file(removed, delta, added, s3_hook):
     current_date = datetime.now()
-    trigger_filename = f"triggerfile_{current_date.strftime('%Y_%m')}.json"
-    trigger_path = os.path.join(TRIGGER_DIRECTORY, trigger_filename)
+    trigger_filename = f"triggerfile_{current_date.strftime('%Y_%m_%d')}.json"
+    s3_key = f"{TRIGGER_FILE_PREFIX}{trigger_filename}"
     
     trigger_content = {
         "removed": removed,
         "modified": delta,
-        "added": added
+        "added": added,
+        "timestamp": current_date.isoformat()
     }
     
     try:
-        with open(trigger_path, 'w') as file:
-            json.dump(trigger_content, file, indent=2)
-        logger.info(f"Trigger file created: {trigger_filename}")
-        return trigger_path
-    except IOError as e:
-        logger.error(f"Error creating trigger file: {e}")
+        s3_hook.load_string(
+            string_data=json.dumps(trigger_content, indent=2),
+            key=s3_key,
+            bucket_name=BUCKET_NAME,
+            replace=True
+        )
+        logger.info(f"Trigger file uploaded to S3: {s3_key}")
+        return s3_key
+    except Exception as e:
+        logger.error(f"Error uploading trigger file to S3: {e}")
         return None
 
+
 def send_telegram_message(message):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.warning("Telegram credentials not set. Skipping Telegram notification.")
+        return
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
         "chat_id": TELEGRAM_CHAT_ID,
@@ -94,11 +107,15 @@ def send_telegram_message(message):
         "parse_mode": "Markdown"
     }
     try:
-        response = requests.post(url, json=payload)
+        response = requests.post(url, json=payload, timeout=10)
         response.raise_for_status()
         logger.info("Telegram message sent successfully")
-    except requests.RequestException as e:
-        logger.error(f"Failed to send Telegram message: {e}")
+    except RequestException as e:
+        logger.error(f"Failed to send Telegram message: {str(e)}")
+    except Exception as e:
+        logger.error(f"Unexpected error when sending Telegram message: {str(e)}")
+
+
 
 def compare_versions(**kwargs):
     s3_hook = S3Hook(aws_conn_id='aws_default')
@@ -114,22 +131,29 @@ def compare_versions(**kwargs):
         removed, delta, added = get_changes(previous_data, latest_data)
         
         if removed or delta or added:
-            trigger_file_path = create_trigger_file(removed, delta, added)
+            trigger_file_s3_key = create_trigger_file(removed, delta, added, s3_hook)
             
-            if trigger_file_path:
-                kwargs['ti'].xcom_push(key='trigger_file_path', value=trigger_file_path)
+            if trigger_file_s3_key:
+                kwargs['ti'].xcom_push(key='trigger_file_s3_key', value=trigger_file_s3_key)
                 kwargs['ti'].xcom_push(key='changes_detected', value=True)
                 
-                message = f"*Sitemap Changes Detected*\n"
+                message = f"*Sitemap Changes Detected*\n\n"
+                message += f"📊 *Statistics:*\n"
                 message += f"- Removed: {len(removed)} items\n"
                 message += f"- Modified: {len(delta)} items\n"
-                message += f"- Added: {len(added)} items\n"
-                message += f"Trigger file created: {os.path.basename(trigger_file_path)}"
+                message += f"- Added: {len(added)} items\n\n"
+                message += f"🔗 *Details:*\n"
+                message += f"- Total items before: {len(previous_data)}\n"
+                message += f"- Total items after: {len(latest_data)}\n"
+                message += f"- Net change: {len(latest_data) - len(previous_data)} items\n\n"
+                message += f"📁 Trigger file uploaded to S3: `{trigger_file_s3_key}`\n\n"
+                message += f"⏳ Update process will start soon."
                 
                 send_telegram_message(message)
-                return 'update_data'
+                logger.info(f"Changes detected and Telegram notification sent. Triggering update DAG.")
+                return 'trigger_update_dag'
             else:
-                logger.error("Failed to create trigger file")
+                logger.error("Failed to upload trigger file to S3")
         else:
             logger.info("No changes detected in the sitemap")
             kwargs['ti'].xcom_push(key='changes_detected', value=False)
@@ -140,25 +164,22 @@ def compare_versions(**kwargs):
     kwargs['ti'].xcom_push(key='changes_detected', value=False)
     return 'no_updates_needed'
 
-def update_data(**kwargs):
-    # Placeholder for data update logic
-    logger.info("Updating data based on detected changes")
-    # Add your data update logic here
-    send_telegram_message("Data update process started")
-
 def no_updates_needed(**kwargs):
     logger.info("No updates needed")
-    send_telegram_message("No sitemap changes detected. No updates needed.")
+    try:
+        send_telegram_message("New sitemap upload. No changes detected. No schema update needed.")
+    except Exception as e:
+        logger.error(f"Error occurred while sending Telegram message: {str(e)}")
 
-def cleanup_old_trigger_files(**kwargs):
-    current_date = datetime.now()
-    for filename in os.listdir(TRIGGER_DIRECTORY):
-        if filename.startswith("triggerfile_"):
-            file_path = os.path.join(TRIGGER_DIRECTORY, filename)
-            file_date = datetime.strptime(filename, "triggerfile_%Y_%m.json")
-            if (current_date - file_date).days > 30:
-                os.remove(file_path)
-                logger.info(f"Removed old trigger file: {filename}")
+# def cleanup_old_trigger_files(**kwargs):
+#     current_date = datetime.now()
+#     for filename in os.listdir(TRIGGER_DIRECTORY):
+#         if filename.startswith("triggerfile_"):
+#             file_path = os.path.join(TRIGGER_DIRECTORY, filename)
+#             file_date = datetime.strptime(filename, "triggerfile_%Y_%m.json")
+#             if (current_date - file_date).days > 30:
+#                 os.remove(file_path)
+#                 logger.info(f"Removed old trigger file: {filename}")
 
 # Task definitions
 compare_task = BranchPythonOperator(
@@ -168,10 +189,10 @@ compare_task = BranchPythonOperator(
     dag=dag,
 )
 
-update_task = PythonOperator(
-    task_id='update_data',
-    python_callable=update_data,
-    provide_context=True,
+trigger_update_dag_task = TriggerDagRunOperator(
+    task_id='trigger_update_dag',
+    trigger_dag_id='triggered_update_pipeline',
+    conf={'trigger_file_s3_key': "{{ task_instance.xcom_pull(task_ids='compare_versions', key='trigger_file_s3_key') }}"},
     dag=dag,
 )
 
@@ -182,13 +203,13 @@ no_update_task = PythonOperator(
     dag=dag,
 )
 
-cleanup_task = PythonOperator(
-    task_id='cleanup_old_trigger_files',
-    python_callable=cleanup_old_trigger_files,
-    provide_context=True,
-    trigger_rule=TriggerRule.ALL_DONE,
-    dag=dag,
-)
+# cleanup_task = PythonOperator(
+#     task_id='cleanup_old_trigger_files',
+#     python_callable=cleanup_old_trigger_files,
+#     provide_context=True,
+#     trigger_rule=TriggerRule.ALL_DONE,
+#     dag=dag,
+# )
 
 # Set up task dependencies
-compare_task >> [update_task, no_update_task] >> cleanup_task
+compare_task >> [trigger_update_dag_task, no_update_task] 
