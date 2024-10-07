@@ -14,9 +14,10 @@ develop-eggs/
 dist/
 downloads/
 eggs/
+scheduler/
+dag_id=*
+dag_processor_manager/
 .eggs/
-logs/   
-logs/*
 lib/
 lib64/
 parts/

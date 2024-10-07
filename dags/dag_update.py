@@ -191,7 +191,7 @@ compare_task = BranchPythonOperator(
 
 trigger_update_dag_task = TriggerDagRunOperator(
     task_id='trigger_update_dag',
-    trigger_dag_id='triggered_update_pipeline',
+    trigger_dag_id='pinecone_update_and_notify_pipeline',
     conf={'trigger_file_s3_key': "{{ task_instance.xcom_pull(task_ids='compare_versions', key='trigger_file_s3_key') }}"},
     dag=dag,
 )
