@@ -25,7 +25,6 @@ FILE_PATH = 'sitemap_data/sitemap_data_2024.json'
 TELEGRAM_BOT_TOKEN = Variable.get("TELEGRAM_BOT_TOKEN", default_var=None)
 TELEGRAM_CHAT_ID = Variable.get("TELEGRAM_CHAT_ID", default_var=None)
 
-
 # DAG definition
 default_args = {
     'owner': 'airflow',
@@ -41,9 +40,10 @@ dag = DAG(
     'sitemap_update_pipeline',
     default_args=default_args,
     description='A DAG for checking sitemap changes and updating data',
-    schedule_interval='@daily',
+    schedule_interval=None,  # Changed from '@daily' to None
     catchup=False
 )
+
 
 def get_s3_version(s3_client, bucket_name, file_path, version='latest'):
     try:
@@ -203,13 +203,5 @@ no_update_task = PythonOperator(
     dag=dag,
 )
 
-# cleanup_task = PythonOperator(
-#     task_id='cleanup_old_trigger_files',
-#     python_callable=cleanup_old_trigger_files,
-#     provide_context=True,
-#     trigger_rule=TriggerRule.ALL_DONE,
-#     dag=dag,
-# )
-
 # Set up task dependencies
-compare_task >> [trigger_update_dag_task, no_update_task] 
+compare_task >> [trigger_update_dag_task, no_update_task]
