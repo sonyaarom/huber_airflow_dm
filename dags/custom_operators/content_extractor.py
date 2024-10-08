@@ -46,31 +46,29 @@ def add_extracted_content_to_df(df: pd.DataFrame) -> pd.DataFrame:
     
     return df
 
-def combine_files(new_file_path, old_file_path, id_column, output_file_path):
+def combine_files(new_df, old_df, id_column):
     """
-    Combines two CSV files based on a common ID column. If the IDs match, the rows from the new file are kept.
+    Combines two DataFrames based on a common ID column. If the IDs match, the rows from the new DataFrame are kept.
     
     Args:
-    new_file_path (str): Path to the new file (CSV format).
-    old_file_path (str): Path to the old file (CSV format).
+    new_df (pd.DataFrame): DataFrame containing the new data.
+    old_df (pd.DataFrame): DataFrame containing the old data.
     id_column (str): The name of the column that contains the IDs to match on.
-    output_file_path (str): Path to save the resulting combined file (CSV format).
     
     Returns:
-    None: The function writes the combined DataFrame to a CSV file.
+    pd.DataFrame: The resulting combined DataFrame.
     """
     
-    # Load the old and new files into dataframes
-    new_df = pd.read_csv(new_file_path)
-    old_df = pd.read_csv(old_file_path)
+    # Merge the old and new DataFrames, keeping rows from the new DataFrame
+    combined_df = pd.merge(new_df, old_df, on=id_column, how='outer', suffixes=('', '_old'))
     
-    # Merge the old and new files, keeping rows from the new file
-    combined_df = pd.merge(new_df, old_df, on=id_column, how='left', suffixes=('', '_old'))
+    # For matching IDs, use the data from the new DataFrame
+    for col in new_df.columns:
+        if col != id_column:
+            combined_df[col] = combined_df[col].fillna(combined_df[f'{col}_old'])
     
-    # Drop any columns that were duplicated (from the old file) if you don't need them
-    for col in combined_df.columns:
-        if '_old' in col:
-            combined_df.drop(columns=[col], inplace=True)
+    # Drop any columns that were duplicated (from the old DataFrame)
+    columns_to_drop = [col for col in combined_df.columns if col.endswith('_old')]
+    combined_df.drop(columns=columns_to_drop, inplace=True)
     
-    # Save the resulting DataFrame to a new CSV file
-    combined_df.to_csv(output_file_path, index=False)
+    return combined_df

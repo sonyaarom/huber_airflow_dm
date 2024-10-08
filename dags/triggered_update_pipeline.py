@@ -1,22 +1,13 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from airflow.providers.amazon.aws.hooks.s3 import S3Hook
-from custom_operators.pinecone_func import get_pinecone_credentials, initialize_pinecone
-import json
-import pandas as pd
 from airflow.models import Variable
 from datetime import datetime, timedelta
-import json
 import logging
+import json
+from typing import Dict, Any, List
+import numpy as np
 import requests
-from io import StringIO
-from requests.exceptions import RequestException
-from typing import Dict, Any
-import os
-from datetime import datetime
-
-
 # Logging setup
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -27,6 +18,10 @@ UNIQUE_IDS_KEY = 'unique_ids/unique_ids.json'
 UNIQUE_IDS_PREFIX = 'unique_ids/'
 ENRICHED_DATA_PREFIX = 'enriched_data/'
 EMBEDDINGS_PREFIX = 'embeddings/'
+BM25_S3_PREFIX = 'bm25/'
+EMBEDDINGS_FILE_NAME = 'recursive-vectors-256chunksize-all-MiniLM-L6-v2-sparse.json'
+TMP_S3_PREFIX = 'tmp/'
+PROCESSED_S3_PREFIX = 'processed_triggers/'
 
 # Telegram setup
 TELEGRAM_BOT_TOKEN = Variable.get("TELEGRAM_BOT_TOKEN", default_var=None)
@@ -47,9 +42,23 @@ dag = DAG(
     'pinecone_update_and_notify_pipeline',
     default_args=default_args,
     description='A DAG to update Pinecone based on sitemap changes and send notifications',
-    schedule_interval=None,  # This DAG will be triggered externally
+    schedule_interval=None,
     catchup=False
 )
+
+
+def numpy_to_python(data):
+    if isinstance(data, dict):
+        return {key: numpy_to_python(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [numpy_to_python(element) for element in data]
+    elif isinstance(data, np.ndarray):
+        return data.tolist()
+    elif isinstance(data, np.generic):  # For scalar numpy types
+        return data.item()
+    else:
+        return data
+
 
 # Helper functions
 def combine_added_and_modified_data(data: Dict[str, Any]) -> Dict[str, Any]:
@@ -72,6 +81,7 @@ def find_all_matching_unique_ids(unique_id_list, id_list):
     return [unique_id for unique_id in unique_id_list if any(unique_id.startswith(id) for id in id_list)]
 
 def send_telegram_message(message):
+    from requests.exceptions import RequestException
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram credentials not set. Skipping Telegram notification.")
         return
@@ -117,6 +127,9 @@ def get_unique_ids():
 ### PART 1: deleting old  and modified data
 
 def process_ids_for_deletion(**kwargs):
+    import pandas as pd
+    from io import StringIO
+    from custom_operators.pinecone_func import get_pinecone_credentials, initialize_pinecone
     ti = kwargs['ti']
     trigger_data = ti.xcom_pull(task_ids='retrieve_trigger_data')
     updated_ids = trigger_data['updated_ids']
@@ -289,56 +302,11 @@ def combine_added_and_modified_data(**kwargs):
 
     return combined_data
 
-
-#     return combined_data
-
-# #task that fetches html content and extracts content from urls in combined data
-# retrieved_data = combine_added_and_modified_data(data)
-def enrich_data_task(**kwargs):
-    import pandas as pd  # Moved inside the function
-    ti = kwargs['ti']
-    data_file_path = retrieved_data
-
-    # Load the data
-    with open(data_file_path, 'r') as f:
-        data_dict = json.load(f)
-
-    # Process the data
-    df = pd.DataFrame.from_dict(data_dict, orient='index').reset_index()
-    df.columns = ['id', 'url', 'last_updated']
-
-    df = df.head(10)
-
-    # Import inside the function
-    from custom_operators.web_utils import add_html_content_to_df
-    from custom_operators.content_extractor import add_extracted_content_to_df
-
-    # Add HTML content to the DataFrame
-    df = add_html_content_to_df(df)
-
-    # Log number of None html_content entries
-    num_none_html = df['html_content'].isnull().sum()
-    logger.info(f"Number of entries with None html_content: {num_none_html}")
-
-    # Extract and add content to the DataFrame
-    df = add_extracted_content_to_df(df)
-
-    # Optionally, drop rows with missing extracted content
-    df = df[df['extracted_content'] != "Title not found Main content not found"]
-
-    # Save enriched data locally
-    os.makedirs(ENRICHED_DATA_DIR, exist_ok=True)
-    enriched_file_path = os.path.join(
-        ENRICHED_DATA_DIR, f'enriched_data_{datetime.now().strftime("%Y%m")}.csv')
-    df.to_csv(enriched_file_path, index=False)
-    logger.info(f"Enriched data saved to: {enriched_file_path}")
-    #push the enriched file path to xcom
-    ti = kwargs['ti']
-    ti.xcom_push(key='enriched_file_path', value=enriched_file_path)
-
-
-
 def enrich_data(**kwargs):
+    import pandas as pd
+    from io import StringIO
+    from custom_operators.web_utils import add_html_content_to_df
+    from custom_operators.content_extractor import add_extracted_content_to_df, combine_files
     ti = kwargs['ti']
     combined_data = ti.xcom_pull(task_ids='combine_added_and_modified_data')
 
@@ -351,8 +319,7 @@ def enrich_data(**kwargs):
 
     # Import custom utility functions
     from custom_operators.web_utils import add_html_content_to_df
-    from custom_operators.content_extractor import add_extracted_content_to_df
-    from custom_operators.content_extractor import combine_files
+    from custom_operators.content_extractor import add_extracted_content_to_df, combine_files
 
     # Add HTML content to the DataFrame
     df_new = add_html_content_to_df(df_new)
@@ -373,26 +340,30 @@ def enrich_data(**kwargs):
     s3_hook = S3Hook(aws_conn_id='aws_default')
     try:
         # Fetch existing file from S3
-        existing_file_obj = s3_hook.get_key(f'{ENRICHED_DATA_PREFIX}main_file.csv', bucket_name=BUCKET_NAME)
+        existing_file_key = f'{ENRICHED_DATA_PREFIX}enriched_data_{datetime.now().strftime("%Y")}.csv'
+        existing_file_obj = s3_hook.get_key(existing_file_key, bucket_name=BUCKET_NAME)
+        
         if existing_file_obj is None:
-            raise FileNotFoundError("No existing file found in S3.")
+            logger.info("No existing file found in S3. Using new data as the main file.")
+            df_combined = df_new
+        else:
+            # Read existing file
+            existing_file_content = existing_file_obj.get()['Body'].read().decode('utf-8')
+            df_existing = pd.read_csv(StringIO(existing_file_content))
+            logger.info("Successfully retrieved the existing file from S3.")
 
-        # Read existing file
-        df_existing = pd.read_csv(StringIO(existing_file_obj.get()['Body'].read().decode('utf-8')))
-        logger.info("Successfully retrieved the existing file from S3.")
+            # Combine new data with existing data
+            df_combined = combine_files(df_new, df_existing, 'id')
+            logger.info("New and existing data combined.")
 
-        # Combine new data with existing data
-        df_combined = combine_files(df_new, df_existing, 'id', 'combined_file.csv')
-        logger.info("New and existing data combined.")
-
-    except FileNotFoundError as e:
-        logger.error(e)
-        # If no existing file, treat the new data as the main file
+    except Exception as e:
+        logger.error(f"Error processing existing file: {str(e)}")
+        # If there's an error, treat the new data as the main file
         df_combined = df_new
-        logger.info("No existing file found, using new data as the main file.")
+        logger.info("Error occurred, using new data as the main file.")
 
     # Save combined (or new) enriched data to S3
-    enriched_file_name = f'enriched_data_{datetime.now().strftime("%Y%")}.csv'
+    enriched_file_name = f'enriched_data_{datetime.now().strftime("%Y")}.csv'
     enriched_file_path = f'{ENRICHED_DATA_PREFIX}{enriched_file_name}'
     
     csv_buffer = StringIO()
@@ -400,9 +371,24 @@ def enrich_data(**kwargs):
     s3_hook.load_string(csv_buffer.getvalue(), enriched_file_path, bucket_name=BUCKET_NAME, replace=True)
 
     logger.info(f"Enriched data saved to S3: {enriched_file_path}")
-    kwargs['ti'].xcom_push(key='enriched_file_path', value=enriched_file_path)
+
+    # Save only the new or updated data for the next task
+    new_data_file_name = f'new_enriched_data_{datetime.now().strftime("%Y%m")}.csv'
+    new_data_file_path = f'{TMP_S3_PREFIX}{new_data_file_name}'
     
-    return {'enriched_file_path': enriched_file_path, 'num_enriched_items': len(df_combined)}
+    csv_buffer = StringIO()
+    df_new.to_csv(csv_buffer, index=False)
+    s3_hook.load_string(csv_buffer.getvalue(), new_data_file_path, bucket_name=BUCKET_NAME, replace=True)
+
+    logger.info(f"New enriched data saved to S3: {new_data_file_path}")
+    kwargs['ti'].xcom_push(key='new_enriched_file_path', value=new_data_file_path)
+    
+    return {
+        'enriched_file_path': enriched_file_path,
+        'new_enriched_file_path': new_data_file_path,
+        'num_enriched_items': len(df_combined),
+        'num_new_items': len(df_new)
+    }
 
 
 def recursive_chunking_and_embedding_task(**kwargs):
@@ -569,37 +555,101 @@ def recursive_chunking_and_embedding_task(**kwargs):
     return chunk_stats
 
 #right now it handles only unique ids, but should also update embeddings and enriched data
+
 def update_storage(**kwargs):
+    from custom_operators.pinecone_func import get_pinecone_credentials, initialize_pinecone, upload_to_pinecone
     ti = kwargs['ti']
-    enriched_data_info = ti.xcom_pull(task_ids='enrich_data')
-    
-    if not enriched_data_info:
-        logger.warning("No enriched data to update storage")
+    embedding_results = ti.xcom_pull(task_ids='embed_and_update_s3')
+
+    logger.info(f"Received embedding results: {embedding_results}")
+
+    if not embedding_results:
+        logger.warning("No embedding results received")
         return None
 
-    s3_hook = S3Hook(aws_conn_id='aws_default')
-    enriched_file_content = s3_hook.read_key(enriched_data_info['enriched_file_path'], BUCKET_NAME)
-    df = pd.read_csv(StringIO(enriched_file_content))
+    new_documents = ti.xcom_pull(key='new_documents', task_ids='embed_and_update_s3')
+
+    if not new_documents:
+        logger.warning("No new documents to update in Pinecone")
+        return None
 
     # Update Pinecone
     api_key, environment, host, index_name = get_pinecone_credentials()
+    
+    logger.info(f"Initializing Pinecone with API key: {api_key[:5]}..., environment: {environment}, host: {host}")
+    
     pc = initialize_pinecone(api_key, environment)
+    
+    logger.info(f"Attempting to access index: {index_name}")
     index = pc.Index(index_name, host=host)
 
-    # TODO: Implement logic to update Pinecone with new/modified data
+    try:
+        stats = index.describe_index_stats()
+        logger.info(f"Successfully connected to index. Stats: {stats}")
+    except Exception as e:
+        logger.error(f"Error accessing index: {str(e)}")
+        raise
+
+    # Get Pinecone configuration from Airflow Variables
+    project_name = Variable.get("PINECONE_PROJECT_NAME", default_var='huber-chatbot-project')
+    metric = Variable.get("PINECONE_METRIC", default_var='cosine')
+
+    # Prepare documents for upload
+    chunk_size = 256  # Adjust this if you're using different chunk sizes
+    documents_dict = {chunk_size: new_documents}
+
+    # Upload to Pinecone
+    upload_to_pinecone(
+        api_key=api_key,
+        documents=documents_dict,
+        index_name=index_name,
+        project_name=project_name,
+        metric=metric,
+        host=host
+    )
+
+    logger.info(f"Completed upload of {len(new_documents)} new documents to Pinecone")
 
     # Update unique IDs list
-    unique_ids_data = s3_hook.read_key(UNIQUE_IDS_KEY, BUCKET_NAME)
-    unique_ids = json.loads(unique_ids_data)
-    new_ids = df['id'].tolist()
-    unique_ids.extend(new_ids)
-    unique_ids = list(set(unique_ids))  # Remove duplicates
-    s3_hook.load_string(json.dumps(unique_ids), UNIQUE_IDS_KEY, bucket_name=BUCKET_NAME, replace=True)
+    s3_hook = S3Hook(aws_conn_id='aws_default')
+    
+    # Read the embeddings file
+    embeddings_key = f'{EMBEDDINGS_PREFIX}{EMBEDDINGS_FILE_NAME}'
+    try:
+        embeddings_data = s3_hook.read_key(embeddings_key, BUCKET_NAME)
+        embeddings = json.loads(embeddings_data)
+        logger.info(f"Successfully read embeddings file: {embeddings_key}")
+    except Exception as e:
+        logger.error(f"Error reading embeddings file: {str(e)}")
+        embeddings = []
 
-    logger.info(f"Updated unique IDs list with {len(new_ids)} new IDs")
-    return {'num_updated_items': len(df)}
+    # Extract all unique IDs from the embeddings
+    all_unique_ids = list(set(doc.get('unique_id') for doc in embeddings if 'unique_id' in doc))
+    logger.info(f"Extracted {len(all_unique_ids)} unique IDs from embeddings")
 
-#task that i will name later
+    # Read the existing unique IDs file
+    try:
+        existing_unique_ids_data = s3_hook.read_key(UNIQUE_IDS_KEY, BUCKET_NAME)
+        existing_unique_ids = set(json.loads(existing_unique_ids_data))
+        logger.info(f"Read {len(existing_unique_ids)} existing unique IDs")
+    except Exception as e:
+        logger.warning(f"Error reading existing unique IDs file: {str(e)}. Starting with empty set.")
+        existing_unique_ids = set()
+
+    # Combine existing and new unique IDs
+    updated_unique_ids = list(existing_unique_ids.union(all_unique_ids))
+    
+    # Write the updated unique IDs back to S3
+    try:
+        s3_hook.load_string(json.dumps(updated_unique_ids), UNIQUE_IDS_KEY, bucket_name=BUCKET_NAME, replace=True)
+        logger.info(f"Successfully updated unique IDs file with {len(updated_unique_ids)} IDs")
+    except Exception as e:
+        logger.error(f"Error writing updated unique IDs file: {str(e)}")
+
+    return {
+        'num_updated_items': len(new_documents),
+        'num_unique_ids': len(updated_unique_ids)
+    }
 
 def final_notification(**kwargs):
     ti = kwargs['ti']
@@ -623,7 +673,195 @@ def final_notification(**kwargs):
     send_telegram_message(message)
     logger.info(f"Processed deletions, additions, and modifications, and sent Telegram notification.")
 
-# Task definitions
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        return super(NumpyEncoder, self).default(obj)
+
+def embed_and_update_s3(**kwargs):
+    import pandas as pd
+    from io import StringIO
+    from sentence_transformers import SentenceTransformer
+    from custom_operators.shared_utils import (
+        apply_bm25_sparse_vectors,
+        embed_dataframe,
+        generate_documents,
+        create_and_save_bm25_corpus,
+        get_overlap
+    )
+    from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+    logger.info("Starting embed_and_update_s3 function")
+
+    ti = kwargs['ti']
+    enriched_data_info = ti.xcom_pull(task_ids='enrich_data')
+    
+    if not enriched_data_info or 'new_enriched_file_path' not in enriched_data_info:
+        logger.warning("No new enriched data to embed")
+        return None
+
+    s3_hook = S3Hook(aws_conn_id='aws_default')
+    new_enriched_file_content = s3_hook.read_key(enriched_data_info['new_enriched_file_path'], BUCKET_NAME)
+    df = pd.read_csv(StringIO(new_enriched_file_content))
+    logger.info(f"Loaded new enriched data: {len(df)} rows")
+
+    # Initialize embedding model
+    embed_model = SentenceTransformer('all-MiniLM-L6-v2', trust_remote_code=True)
+    logger.info("Initialized SentenceTransformer model")
+    
+    # Create chunks
+    text_splitter = RecursiveCharacterTextSplitter(
+        chunk_size=256,
+        chunk_overlap=get_overlap(256),
+        length_function=len,
+        is_separator_regex=False,
+    )
+
+    all_chunks = []
+    unique_ids = []
+    general_ids = []
+    urls = []
+    last_updateds = []
+    html_contents = []
+
+    for idx, row in df.iterrows():
+        text = row.get('extracted_content', '')
+        if isinstance(text, str):
+            chunks = text_splitter.split_text(text)
+            all_chunks.extend(chunks)
+            unique_ids.extend([f"{row['id']}_{i+1}" for i in range(len(chunks))])
+            general_ids.extend([row['id']] * len(chunks))
+            urls.extend([row['url']] * len(chunks))
+            last_updateds.extend([row.get('last_updated', '')] * len(chunks))
+            html_contents.extend([row.get('html_content', '')] * len(chunks))
+
+    chunked_df = pd.DataFrame({
+        'unique_id': unique_ids,
+        'url': urls,
+        'last_updated': last_updateds,
+        'html_content': html_contents,
+        'text': all_chunks,
+        'len': [len(chunk) for chunk in all_chunks],
+        'general_id': general_ids,
+    })
+
+    chunked_df = chunked_df[chunked_df['len'] >= 50]
+    logger.info(f"Created {len(chunked_df)} chunks after filtering")
+
+    # Apply BM25 sparse vectorization
+    bm25_file_key = f'{BM25_S3_PREFIX}bm25_values.json'
+    try:
+        bm25_values = json.loads(s3_hook.read_key(bm25_file_key, BUCKET_NAME))
+        logger.info("Loaded existing BM25 values from S3")
+    except Exception as e:
+        logger.info(f"Creating new BM25 corpus and saving to S3: {bm25_file_key}")
+        bm25_values = create_and_save_bm25_corpus(df, 'extracted_content', None)
+        s3_hook.load_string(json.dumps(bm25_values), bm25_file_key, bucket_name=BUCKET_NAME, replace=True)
+    
+    chunked_df = apply_bm25_sparse_vectors(chunked_df, 'text', bm25_values)
+    logger.info("Applied BM25 sparse vectorization")
+
+    # Embed the chunked texts
+    embedded_df = embed_dataframe(chunked_df, embed_model)
+    logger.info("Completed embedding of chunked texts")
+
+    # Generate document dictionaries
+    new_documents = generate_documents(embedded_df, 256, 'recursive')
+    logger.info(f"Generated {len(new_documents)} new document dictionaries")
+
+    # Update or create the JSON file in S3
+    embeddings_key = f'{EMBEDDINGS_PREFIX}{EMBEDDINGS_FILE_NAME}'
+    
+    # Read existing embeddings file
+    try:
+        existing_embeddings_str = s3_hook.read_key(embeddings_key, BUCKET_NAME)
+        existing_embeddings = json.loads(existing_embeddings_str) if existing_embeddings_str else []
+        logger.info(f"Loaded existing embeddings from S3: {len(existing_embeddings)} documents")
+    except Exception as e:
+        logger.warning(f"Error reading existing embeddings: {str(e)}. Starting with empty list.")
+        existing_embeddings = []
+
+    # Update existing documents and add new ones
+    updated_count = 0
+    added_count = 0
+    existing_ids = {doc['unique_id']: i for i, doc in enumerate(existing_embeddings)}
+    
+    for doc in new_documents:
+        if doc['unique_id'] in existing_ids:
+            existing_embeddings[existing_ids[doc['unique_id']]] = doc
+            updated_count += 1
+        else:
+            existing_embeddings.append(doc)
+            existing_ids[doc['unique_id']] = len(existing_embeddings) - 1
+            added_count += 1
+
+    logger.info(f"Updated {updated_count} existing documents and added {added_count} new documents")
+
+    # Prepare JSON for upload
+    embeddings_json = json.dumps(existing_embeddings, cls=NumpyEncoder)
+    logger.info(f"Prepared JSON string for S3 upload: {len(embeddings_json)} characters")
+
+    # Upload to S3
+    s3_hook.load_string(
+        embeddings_json,
+        embeddings_key,
+        bucket_name=BUCKET_NAME,
+        replace=True
+    )
+    logger.info(f"Uploaded updated embeddings to S3: {embeddings_key}")
+    
+    logger.info(f"Total documents in updated embeddings file: {len(existing_embeddings)}")
+    logger.info(f"Number of new or updated documents: {len(new_documents)}")
+
+    ti.xcom_push(key='new_documents', value=numpy_to_python(new_documents))
+
+    return {
+        'embeddings_key': embeddings_key, 
+        'num_new_embeddings': len(new_documents)
+    }
+
+def move_trigger_file(**kwargs):
+    from datetime import datetime
+    
+    ti = kwargs['ti']
+    dag_run = kwargs['dag_run']
+    
+    # Get the original trigger file S3 key
+    trigger_file_s3_key = dag_run.conf.get('trigger_file_s3_key')
+    if not trigger_file_s3_key:
+        raise ValueError("No trigger file S3 key provided")
+    
+    s3_hook = S3Hook(aws_conn_id='aws_default')
+    
+    # Generate the new key for the processed trigger file
+    current_date = datetime.now().strftime("%Y%m%d%H%M%S")
+    new_key = f'{PROCESSED_S3_PREFIX}processed_trigger_{current_date}.json'
+    
+    try:
+        # Copy the file to the new location
+        s3_hook.copy_object(
+            source_bucket_key=trigger_file_s3_key,
+            dest_bucket_key=new_key,
+            source_bucket_name=BUCKET_NAME,
+            dest_bucket_name=BUCKET_NAME
+        )
+        logger.info(f"Successfully copied trigger file to {new_key}")
+        
+        # Delete the original file
+        s3_hook.delete_objects(bucket=BUCKET_NAME, keys=[trigger_file_s3_key])
+        logger.info(f"Successfully deleted original trigger file: {trigger_file_s3_key}")
+    
+    except Exception as e:
+        logger.error(f"Error moving trigger file: {str(e)}")
+        raise
+    
+    return {"processed_trigger_file": new_key}
+
 retrieve_trigger_data_task = PythonOperator(
     task_id='retrieve_trigger_data',
     python_callable=retrieve_trigger_data,
@@ -658,6 +896,13 @@ enrich_data_task = PythonOperator(
     dag=dag,
 )
 
+embed_and_update_s3_task = PythonOperator(
+    task_id='embed_and_update_s3',
+    python_callable=embed_and_update_s3,
+    provide_context=True,
+    dag=dag,
+)
+
 update_storage_task = PythonOperator(
     task_id='update_storage',
     python_callable=update_storage,
@@ -672,8 +917,17 @@ final_notification_task = PythonOperator(
     dag=dag,
 )
 
-# Define task dependencies
+move_trigger_file_task = PythonOperator(
+    task_id='move_trigger_file',
+    python_callable=move_trigger_file,
+    provide_context=True,
+    dag=dag,
+)
+
+
+#Dependencies
 retrieve_trigger_data_task >> [get_unique_ids_task, combine_data_task]
 get_unique_ids_task >> process_ids_task
-combine_data_task >> enrich_data_task >> update_storage_task
+combine_data_task >> enrich_data_task >> embed_and_update_s3_task >> update_storage_task
 [process_ids_task, update_storage_task] >> final_notification_task
+final_notification_task >> move_trigger_file_task

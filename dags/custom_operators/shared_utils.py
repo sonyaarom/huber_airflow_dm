@@ -478,3 +478,7 @@ def upload_to_pinecone(documents, pc, embedding_model_name, api_key, environment
                 break
         else:
             logger.info(f"Successfully uploaded {len(new_docs)} new documents to index '{index_name}'")
+
+
+def get_overlap(chunk_size: int) -> int:
+    return 50 if chunk_size <= 256 else 200

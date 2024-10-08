@@ -1,12 +1,13 @@
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.models import Variable  # For Airflow Variables
-from airflow.hooks.base import BaseHook  # For Airflow Connections
+from airflow.models import Variable
+from airflow.hooks.base import BaseHook
 from datetime import datetime, timedelta
 import os
 import json
 import logging
 import shutil
+from airflow.hooks.S3_hook import S3Hook
 
 # Initialize logger
 logging.basicConfig(level=logging.INFO)
@@ -14,18 +15,17 @@ logger = logging.getLogger(__name__)
 
 # Constants
 BUCKET_NAME = 'huber-chatbot-project'
-SITEMAP_DATA_DIR = '/opt/airflow/dags/data'
 S3_KEY_PREFIX = f'sitemap_data/sitemap_data_{datetime.now().strftime("%Y")}.json'
 ENRICHED_DATA_S3_PREFIX = f'enriched_data/enriched_data_{datetime.now().strftime("%Y")}.csv'
 EMBEDDINGS_S3_PREFIX = 'embeddings/'
 BM25_S3_PREFIX = 'bm25/'
+UNIQUE_IDS_S3_PREFIX = 'unique_ids/'
+
+LOCAL_DATA_DIR = '/opt/airflow/dags/data'
 ENRICHED_DATA_DIR = '/opt/airflow/dags/enriched'
 EMBEDDINGS_DIR = '/opt/airflow/dags/embeddings'
 BM25_DIR = '/opt/airflow/dags/bm25'
-UNIQUE_IDS_S3_PREFIX = 'unique_ids/'
 UNIQUE_IDS_DIR = '/opt/airflow/dags/unique_ids'
-
-
 
 # Airflow default arguments
 default_args = {
@@ -40,104 +40,58 @@ default_args = {
 
 # DAG definition
 dag = DAG(
-    'sitemap_retrieval_and_enrichment',
+    'test_dag',
     default_args=default_args,
-    description='A DAG for retrieving sitemaps and enriching data',
+    description='A DAG for processing existing S3 data, enriching, and uploading to Pinecone',
     schedule_interval=None,
     catchup=False
 )
 
-
-def process_sitemap_task(**kwargs):
-    from custom_operators.sitemap_processor import process_sitemap
-
-    url = 'https://www.wiwi.hu-berlin.de/sitemap.xml.gz'
-    exclude_extensions = ['.jpg', '.pdf', '.jpeg', '.png']
-    exclude_patterns = ['view']
-    include_patterns = ['/en/']
-    allowed_base_url = 'https://www.wiwi.hu-berlin.de'
-
-    data_dict, total, filtered, safe, unsafe = process_sitemap(
-        url, exclude_extensions, exclude_patterns, include_patterns, allowed_base_url
-    )
-
-    logger.info(f"Total entries: {total}")
-    logger.info(f"Filtered entries: {filtered}")
-    logger.info(f"Safe entries: {safe}")
-    logger.info(f"Unsafe entries: {unsafe}")
-
-    # Save the data_dict to a JSON file and pass the file path
-    os.makedirs(SITEMAP_DATA_DIR, exist_ok=True)
-    data_file_path = os.path.join(SITEMAP_DATA_DIR, 'sitemap_data.json')
-    with open(data_file_path, 'w') as f:
-        json.dump(data_dict, f)
-    kwargs['ti'].xcom_push(key='data_file_path', value=data_file_path)
-
-
-
-def upload_to_s3_task(**kwargs):
-    from airflow.hooks.S3_hook import S3Hook
-    ti = kwargs['ti']
-    data_file_path = ti.xcom_pull(key='data_file_path', task_ids='process_sitemap')
-
+def check_s3_data_task(**kwargs):
     s3_hook = S3Hook(aws_conn_id='aws_default')
-    s3_hook.load_file(
-        filename=data_file_path,
-        key=S3_KEY_PREFIX,
-        bucket_name=BUCKET_NAME,
-        replace=True
-    )
-    logger.info(f"Data uploaded to S3 bucket: {BUCKET_NAME}")
-    logger.info(f"S3 key: {S3_KEY_PREFIX}")
+    if not s3_hook.check_for_key(S3_KEY_PREFIX, bucket_name=BUCKET_NAME):
+        raise FileNotFoundError(f"No data found in S3 at {S3_KEY_PREFIX}")
+    
+    data = s3_hook.read_key(S3_KEY_PREFIX, bucket_name=BUCKET_NAME)
+    data_dict = json.loads(data)
+    
+    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
+    local_file_path = os.path.join(LOCAL_DATA_DIR, 'sitemap_data.json')
+    with open(local_file_path, 'w') as f:
+        json.dump(data_dict, f)
+    
+    kwargs['ti'].xcom_push(key='data_file_path', value=local_file_path)
+    logger.info(f"Data retrieved from S3 and saved locally at: {local_file_path}")
 
 def enrich_data_task(**kwargs):
-    import pandas as pd  # Moved inside the function
+    import pandas as pd
     ti = kwargs['ti']
-    data_file_path = ti.xcom_pull(key='data_file_path', task_ids='process_sitemap')
+    data_file_path = ti.xcom_pull(key='data_file_path', task_ids='check_s3_data')
 
-    # Load the data
     with open(data_file_path, 'r') as f:
         data_dict = json.load(f)
 
-    # Process the data
     df = pd.DataFrame.from_dict(data_dict, orient='index').reset_index()
     df.columns = ['id', 'url', 'last_updated']
 
-    df = df.head(10)
-
-    # Import inside the function
     from custom_operators.web_utils import add_html_content_to_df
     from custom_operators.content_extractor import add_extracted_content_to_df
 
-    # Add HTML content to the DataFrame
     df = add_html_content_to_df(df)
-
-    # Log number of None html_content entries
-    num_none_html = df['html_content'].isnull().sum()
-    logger.info(f"Number of entries with None html_content: {num_none_html}")
-
-    # Extract and add content to the DataFrame
     df = add_extracted_content_to_df(df)
-
-    # Optionally, drop rows with missing extracted content
     df = df[df['extracted_content'] != "Title not found Main content not found"]
 
-    # Save enriched data locally
     os.makedirs(ENRICHED_DATA_DIR, exist_ok=True)
-    enriched_file_path = os.path.join(
-        ENRICHED_DATA_DIR, f'enriched_data_{datetime.now().strftime("%Y")}.csv')
+    enriched_file_path = os.path.join(ENRICHED_DATA_DIR, f'enriched_data_{datetime.now().strftime("%Y")}.csv')
     df.to_csv(enriched_file_path, index=False)
     logger.info(f"Enriched data saved to: {enriched_file_path}")
-    #push the enriched file path to xcom
-    ti = kwargs['ti']
     ti.xcom_push(key='enriched_file_path', value=enriched_file_path)
 
 def upload_enriched_data_to_s3_task(**kwargs):
-    from airflow.hooks.S3_hook import S3Hook
+    s3_hook = S3Hook(aws_conn_id='aws_default')
     ti = kwargs['ti']
     enriched_file_path = ti.xcom_pull(key='enriched_file_path', task_ids='enrich_data')
 
-    s3_hook = S3Hook(aws_conn_id='aws_default')
     s3_hook.load_file(
         filename=enriched_file_path,
         key=ENRICHED_DATA_S3_PREFIX,
@@ -146,7 +100,6 @@ def upload_enriched_data_to_s3_task(**kwargs):
     )
     logger.info(f"Enriched data uploaded to S3 bucket: {BUCKET_NAME}")
     logger.info(f"S3 key: {ENRICHED_DATA_S3_PREFIX}")
-    
 
 
 def recursive_chunking_and_embedding_task(**kwargs):
@@ -312,7 +265,6 @@ def recursive_chunking_and_embedding_task(**kwargs):
     # Optionally, return the chunk statistics
     return chunk_stats
 
-
 def upload_embeddings_to_s3_task(**kwargs):
     from airflow.hooks.S3_hook import S3Hook
     ti = kwargs['ti']
@@ -446,8 +398,7 @@ def extract_and_upload_unique_ids_task(**kwargs):
 
 
 def cleanup_local_files_task(**kwargs):
-    """Delete locally stored BM25, embeddings, and enriched files after S3 upload."""
-    directories_to_clean = [SITEMAP_DATA_DIR, ENRICHED_DATA_DIR, EMBEDDINGS_DIR, BM25_DIR, UNIQUE_IDS_DIR]
+    directories_to_clean = [LOCAL_DATA_DIR, ENRICHED_DATA_DIR, EMBEDDINGS_DIR, BM25_DIR, UNIQUE_IDS_DIR]
     
     for directory in directories_to_clean:
         if os.path.exists(directory):
@@ -456,76 +407,69 @@ def cleanup_local_files_task(**kwargs):
         else:
             logger.info(f"Directory does not exist: {directory}")
 
-
 # Define the tasks
 t1 = PythonOperator(
-    task_id='process_sitemap',
-    python_callable=process_sitemap_task,
+    task_id='check_s3_data',
+    python_callable=check_s3_data_task,
     provide_context=True,
     dag=dag,
 )
 
 t2 = PythonOperator(
-    task_id='upload_to_s3',
-    python_callable=upload_to_s3_task,
-    provide_context=True,
-    dag=dag,
-)
-
-t3 = PythonOperator(
     task_id='enrich_data',
     python_callable=enrich_data_task,
     provide_context=True,
     dag=dag,
 )
 
-t4 = PythonOperator(
+t3 = PythonOperator(
     task_id='upload_enriched_data_to_s3',
     python_callable=upload_enriched_data_to_s3_task,
     provide_context=True,
     dag=dag,
 )
 
-t5 = PythonOperator(
+t4 = PythonOperator(
     task_id='recursive_chunking_and_embedding',
     python_callable=recursive_chunking_and_embedding_task,
     provide_context=True,
     dag=dag,
 )
 
-t6 = PythonOperator(
+t5 = PythonOperator(
     task_id='upload_embeddings_to_s3',
     python_callable=upload_embeddings_to_s3_task,
     provide_context=True,
     dag=dag,
 )
 
-t7 = PythonOperator(
+t6 = PythonOperator(
     task_id='upload_bm25_to_s3',
     python_callable=upload_bm25_to_s3_task,
     provide_context=True,
     dag=dag,
 )
 
-t8 = PythonOperator(
+t7 = PythonOperator(
     task_id='upload_to_pinecone',
     python_callable=upload_to_pinecone_task,
     provide_context=True,
     dag=dag,
 )
 
-t9 = PythonOperator(
+t8 = PythonOperator(
     task_id='extract_and_upload_unique_ids',
     python_callable=extract_and_upload_unique_ids_task,
     provide_context=True,
     dag=dag,
 )
 
-t10 = PythonOperator(
+t9 = PythonOperator(
     task_id='cleanup_local_files',
     python_callable=cleanup_local_files_task,
     provide_context=True,
     dag=dag,
 )
+
 # Set the task dependencies
-t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8 >> t9 >> t10
+t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8 >> t9
