@@ -307,6 +307,7 @@ def enrich_data(**kwargs):
     from io import StringIO
     from custom_operators.web_utils import add_html_content_to_df
     from custom_operators.content_extractor import add_extracted_content_to_df, combine_files
+    
     ti = kwargs['ti']
     combined_data = ti.xcom_pull(task_ids='combine_added_and_modified_data')
 
@@ -316,31 +317,32 @@ def enrich_data(**kwargs):
 
     df_new = pd.DataFrame.from_dict(combined_data, orient='index').reset_index()
     df_new.columns = ['id', 'url', 'last_updated']
-
-    # Import custom utility functions
-    from custom_operators.web_utils import add_html_content_to_df
-    from custom_operators.content_extractor import add_extracted_content_to_df, combine_files
+    logger.info(f"New data to enrich: {len(df_new)} rows")
+    logger.info(f"New data columns: {df_new.columns.tolist()}")
+    logger.info(f"New data sample: \n{df_new.head().to_string()}")
 
     # Add HTML content to the DataFrame
     df_new = add_html_content_to_df(df_new)
 
     # Drop rows with null html_content
     df_new = df_new.dropna(subset=['html_content'])
-
-    # Log number of remaining entries
-    logger.info(f"Number of remaining entries after dropping null html_content: {len(df_new)}")
+    logger.info(f"Rows after dropping null html_content: {len(df_new)}")
 
     # Extract and add content to the DataFrame
     df_new = add_extracted_content_to_df(df_new)
 
     # Optionally, drop rows with missing extracted content
     df_new = df_new[df_new['extracted_content'] != "Title not found Main content not found"]
+    logger.info(f"Rows after filtering extracted content: {len(df_new)}")
+    logger.info(f"Enriched new data columns: {df_new.columns.tolist()}")
+    logger.info(f"Enriched new data sample: \n{df_new.head().to_string()}")
 
     # Setup S3 hook and check for existing file
     s3_hook = S3Hook(aws_conn_id='aws_default')
+    existing_file_key = f'{ENRICHED_DATA_PREFIX}enriched_data_{datetime.now().strftime("%Y")}.csv'
+    
     try:
         # Fetch existing file from S3
-        existing_file_key = f'{ENRICHED_DATA_PREFIX}enriched_data_{datetime.now().strftime("%Y")}.csv'
         existing_file_obj = s3_hook.get_key(existing_file_key, bucket_name=BUCKET_NAME)
         
         if existing_file_obj is None:
@@ -350,21 +352,36 @@ def enrich_data(**kwargs):
             # Read existing file
             existing_file_content = existing_file_obj.get()['Body'].read().decode('utf-8')
             df_existing = pd.read_csv(StringIO(existing_file_content))
-            logger.info("Successfully retrieved the existing file from S3.")
+            logger.info(f"Successfully retrieved the existing file from S3. Rows: {len(df_existing)}")
+            logger.info(f"Existing data columns: {df_existing.columns.tolist()}")
+            logger.info(f"Existing data sample: \n{df_existing.head().to_string()}")
 
             # Combine new data with existing data
             df_combined = combine_files(df_new, df_existing, 'id')
             logger.info("New and existing data combined.")
+            logger.info(f"Combined data rows: {len(df_combined)}")
+            logger.info(f"Combined data columns: {df_combined.columns.tolist()}")
+            logger.info(f"Combined data sample: \n{df_combined.head().to_string()}")
+            
+            # Check for NaN values
+            nan_count = df_combined.isna().sum().sum()
+            if nan_count > 0:
+                logger.warning(f"Found {nan_count} NaN values in the combined data.")
+                logger.warning(f"Columns with NaN: {df_combined.columns[df_combined.isna().any()].tolist()}")
+                
+                # Fill NaN values with a placeholder or drop rows with NaN
+                df_combined = df_combined.dropna(subset=['html_content', 'extracted_content']) # or use df_combined.dropna() if you prefer to drop rows
+                logger.info("Filled NaN values with 'N/A'")
 
     except Exception as e:
         logger.error(f"Error processing existing file: {str(e)}")
+        logger.exception("Full traceback:")
         # If there's an error, treat the new data as the main file
         df_combined = df_new
         logger.info("Error occurred, using new data as the main file.")
 
     # Save combined (or new) enriched data to S3
-    enriched_file_name = f'enriched_data_{datetime.now().strftime("%Y")}.csv'
-    enriched_file_path = f'{ENRICHED_DATA_PREFIX}{enriched_file_name}'
+    enriched_file_path = existing_file_key
     
     csv_buffer = StringIO()
     df_combined.to_csv(csv_buffer, index=False)
