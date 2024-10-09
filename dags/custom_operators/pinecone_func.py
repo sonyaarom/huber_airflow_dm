@@ -3,17 +3,9 @@ import logging
 from typing import Dict, List, Tuple, Optional, Any
 from pinecone import Pinecone, ServerlessSpec, PineconeException
 from tqdm import tqdm
-        
 import numpy as np
-from typing import Dict, List, Any
-from pinecone import Pinecone, PineconeException
-from tqdm import tqdm
-
-from typing import Dict, List, Any
-from tqdm import tqdm
 import pinecone
-from pinecone import Pinecone, PineconeException
-import logging
+
 
 
 # Set up logging
@@ -22,6 +14,9 @@ logger = logging.getLogger(__name__)
 
 
 def get_pinecone_credentials():
+    """
+    Retrieves Pinecone credentials from Airflow Variables.
+    """
     from airflow.models import Variable
     api_key = Variable.get("PINECONE_API_KEY")
     environment = Variable.get("PINECONE_ENVIRONMENT")
@@ -31,6 +26,9 @@ def get_pinecone_credentials():
 
 
 def initialize_pinecone(api_key: str = None, environment: str = None) -> Pinecone:
+    """
+    Initializes the Pinecone connection.
+    """
     logger.info("Initializing Pinecone connection")
     
     api_key = api_key or os.getenv('PINECONE_API_KEY')

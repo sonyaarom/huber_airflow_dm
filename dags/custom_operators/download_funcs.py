@@ -151,6 +151,15 @@ def store_file(temp_file_path, local_directory=None, bucket_name=None, s3_key_pr
     return result
 
 def download_file_from_s3(bucket_name, object_key, local_file_path=None):
+    """
+    Downloads a file from an S3 bucket and stores it locally.
+
+    Args:
+        bucket_name (str): The name of the S3 bucket.
+        object_key (str): The key of the file to download.
+        local_file_path (str, optional): The local path to store the file. If None, a temporary directory is used.
+
+    """
     # Create an S3 client
     s3 = boto3.client('s3')
     

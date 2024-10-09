@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 import os
 import json
 import logging
-from custom_operators.web_utils import send_telegram_message
+
 
 # Initialize logger
 logging.basicConfig(level=logging.INFO)

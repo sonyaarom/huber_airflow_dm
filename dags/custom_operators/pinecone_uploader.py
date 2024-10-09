@@ -7,6 +7,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from pinecone_func import initialize_pinecone, create_pinecone_index, upload_to_pinecone
 
+
 # Set up logging
 logging.basicConfig(level=logging.INFO, 
                     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -18,6 +19,12 @@ logger = logging.getLogger(__name__)
 
 
 class VectorFileHandler(FileSystemEventHandler):
+    """
+    Handles file events for vector files.
+
+    This class extends FileSystemEventHandler and provides methods to handle file events.
+    It processes vector files, extracts metadata, and uploads them to Pinecone.
+    """
     def __init__(self, pinecone_client, embedding_model_name, project_name, metric):
         self.pc = pinecone_client
         self.embedding_model_name = embedding_model_name
@@ -26,6 +33,12 @@ class VectorFileHandler(FileSystemEventHandler):
         logger.info(f"VectorFileHandler initialized with embedding model: {embedding_model_name}, project: {project_name}, and metric: {metric}")
 
     def process_file(self, file_path):
+        """
+        Processes a vector file.
+
+        This method opens the file, extracts the document type and chunk size,
+        and uploads the vectors to Pinecone.
+        """
         logger.info(f"Processing file: {file_path}")
         try:
             with open(file_path, 'r') as file:
@@ -60,6 +73,13 @@ class VectorFileHandler(FileSystemEventHandler):
             logger.exception(f"Error processing file {file_path}: {str(e)}")
 
 def process_existing_files(folder_path, handler):
+    """
+    Processes existing files in the specified folder.
+
+    This function lists all files in the given folder,
+    checks if they end with '.json' and contain the embedding model name,
+    and processes them using the provided handler.
+    """
     logger.info(f"Processing existing files in {folder_path}")
     for filename in os.listdir(folder_path):
         if filename.endswith('.json') and handler.embedding_model_name in filename:
@@ -68,6 +88,12 @@ def process_existing_files(folder_path, handler):
     logger.info("Finished processing existing files")
 
 def delete_all_vectors(pinecone_client):
+    """
+    Deletes all vectors from all indexes.
+
+    This function lists all indexes, checks if they have vectors,
+    and deletes them if they do.
+    """
     logger.info("Starting deletion of all vectors from all indexes")
     try:
         indexes = pinecone_client.list_indexes()
@@ -111,6 +137,11 @@ def delete_index_interactive(pinecone_client, index_name):
         return False
 
 def delete_all_indexes(pinecone_client, interactive=True):
+    """
+    Deletes all indexes.
+
+    This function lists all indexes and deletes them.
+    """
     logger.info("Starting deletion of indexes")
     try:
         indexes = pinecone_client.list_indexes()
@@ -138,6 +169,13 @@ def delete_all_indexes(pinecone_client, interactive=True):
 
 
 def upload_files(folder_path, pinecone_client, embedding_model_name, project_name, metric):
+    """
+    Uploads files from a folder to Pinecone.
+
+    This function lists all files in the given folder,
+    checks if they end with '.json' and contain the embedding model name,
+    and processes them using the provided handler.
+    """
     logger.info(f"Processing files in folder: {folder_path} for project: {project_name} with metric: {metric}")
     event_handler = VectorFileHandler(pinecone_client, embedding_model_name, project_name, metric)
     
@@ -149,19 +187,7 @@ def upload_files(folder_path, pinecone_client, embedding_model_name, project_nam
             event_handler.process_file(file_path)
     
     logger.info("Finished processing all files in the folder")
-import os
-import argparse
-import logging
-from pinecone_func import initialize_pinecone, create_pinecone_index, upload_to_pinecone
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, 
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                    handlers=[
-                        logging.FileHandler("pinecone_uploader.log"),
-                        logging.StreamHandler()
-                    ])
-logger = logging.getLogger(__name__)
 
 def main():
     parser = argparse.ArgumentParser(description="Pinecone Vector Upload and Delete Tool")
@@ -227,5 +253,6 @@ if __name__ == "__main__":
     main()
 
 
+#Implementation Example
 #python pinecone_uploader.py --folder FOLDER --embedding_model EMBED_NAME  --project PROJECT_INTERNAL --metric dotproduct/euclidean/cosine  --api_key API_KEY
 #python pinecone_uploader.py --delete all --embedding_model EMBED_NAME --api_key API_KEY
