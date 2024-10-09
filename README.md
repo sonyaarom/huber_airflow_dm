@@ -1,4 +1,4 @@
-# HUBer: Data Management
+# HUBer: Data Management Pipeline
 
 This repository is the data management component of the HUBer Project. It contains an Airflow-based pipeline for web scraping, data processing, and storage management, developed as part of a master's thesis research project at Humboldt University of Berlin. The pipeline is designed to periodically retrieve and process website content, maintaining an up-to-date knowledge base for a chatbot system without the need for manual intervention.
 
@@ -52,7 +52,7 @@ The project consists of four main Directed Acyclic Graphs (DAGs) and several cus
    cd huber-data-management
    ```
 
-3. Create a `.env` file and add necessary environment variables, such as your AWS credentials and Pinecone API key.
+3. Create a `.env` file and add necessary environment variables, such as your AWS credentials and Pinecone API key. Create folders: dags/, plugins/, logs/, and config/ in your repository before running the next steps.
 
 
 4. Build the Docker image:
