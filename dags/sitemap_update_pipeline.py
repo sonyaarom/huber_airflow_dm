@@ -1,3 +1,9 @@
+"""
+This DAG is designed to compare the current and previous versions of the sitemap data,
+detect any changes, and trigger the pinecone_update_and_notify_pipeline DAG if changes are detected.
+It also sends a Telegram notification if changes are detected.
+"""
+
 from airflow import DAG
 from airflow.operators.trigger_dagrun import TriggerDagRunOperator
 from airflow.operators.python import PythonOperator, BranchPythonOperator
@@ -9,9 +15,9 @@ from requests.exceptions import RequestException
 from botocore.exceptions import ClientError
 from datetime import datetime, timedelta
 import json
-import os
 import logging
 import requests
+from custom_operators.web_utils import send_telegram_message
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -46,6 +52,13 @@ dag = DAG(
 
 
 def get_s3_version(s3_client, bucket_name, file_path, version='latest'):
+    """
+    Retrieves the content of a specific version of a file from S3.
+
+    This function retrieves the content of a file from S3 based on the specified version.
+    If the version is 'latest', it retrieves the latest version of the file.
+    Otherwise, it retrieves a specific version of the file by its version ID.
+    """
     try:
         if version == 'latest':
             response = s3_client.get_object(Bucket=bucket_name, Key=file_path)
@@ -63,6 +76,12 @@ def get_s3_version(s3_client, bucket_name, file_path, version='latest'):
         return None
 
 def get_changes(old_content, new_content):
+    """
+    Compares two versions of sitemap data and identifies changes.
+
+    This function takes two versions of sitemap data, old_content and new_content,
+    and returns three sets: removed, delta, and added.
+    """
     removed = {k: v for k, v in old_content.items() if k not in new_content}
     delta = {k: new_content[k] for k in set(old_content) & set(new_content) if old_content[k] != new_content[k]}
     added = {k: v for k, v in new_content.items() if k not in old_content}
@@ -70,6 +89,12 @@ def get_changes(old_content, new_content):
 
 
 def create_trigger_file(removed, delta, added, s3_hook):
+    """
+    Creates a trigger file with the changes detected in the sitemap data.
+
+    This function takes the removed, delta, and added sets, and creates a JSON file
+    containing the changes detected. It also includes the current date in the file.
+    """
     current_date = datetime.now()
     trigger_filename = f"triggerfile_{current_date.strftime('%Y_%m_%d')}.json"
     s3_key = f"{TRIGGER_FILE_PREFIX}{trigger_filename}"
@@ -95,29 +120,16 @@ def create_trigger_file(removed, delta, added, s3_hook):
         return None
 
 
-def send_telegram_message(message):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.warning("Telegram credentials not set. Skipping Telegram notification.")
-        return
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "parse_mode": "Markdown"
-    }
-    try:
-        response = requests.post(url, json=payload, timeout=10)
-        response.raise_for_status()
-        logger.info("Telegram message sent successfully")
-    except RequestException as e:
-        logger.error(f"Failed to send Telegram message: {str(e)}")
-    except Exception as e:
-        logger.error(f"Unexpected error when sending Telegram message: {str(e)}")
 
 
-
+#Compare Versions Task (compare_task)
 def compare_versions(**kwargs):
+    """
+    Compares the current and previous versions of the sitemap data.
+
+    This function retrieves the latest and previous versions of the sitemap data from S3,
+    compares them, and identifies any changes. It then creates a trigger file with the changes.
+    """
     s3_hook = S3Hook(aws_conn_id='aws_default')
     s3_client = s3_hook.get_conn()
     
@@ -164,24 +176,19 @@ def compare_versions(**kwargs):
     kwargs['ti'].xcom_push(key='changes_detected', value=False)
     return 'no_updates_needed'
 
+#No Updates Needed Task (no_update_task)
 def no_updates_needed(**kwargs):
+    """
+    Handles the case where no updates are needed.
+
+    This function logs a message indicating that no updates are needed and sends a Telegram notification.
+    """
     logger.info("No updates needed")
     try:
         send_telegram_message("New sitemap upload. No changes detected. No schema update needed.")
     except Exception as e:
         logger.error(f"Error occurred while sending Telegram message: {str(e)}")
 
-# def cleanup_old_trigger_files(**kwargs):
-#     current_date = datetime.now()
-#     for filename in os.listdir(TRIGGER_DIRECTORY):
-#         if filename.startswith("triggerfile_"):
-#             file_path = os.path.join(TRIGGER_DIRECTORY, filename)
-#             file_date = datetime.strptime(filename, "triggerfile_%Y_%m.json")
-#             if (current_date - file_date).days > 30:
-#                 os.remove(file_path)
-#                 logger.info(f"Removed old trigger file: {filename}")
-
-# Task definitions
 compare_task = BranchPythonOperator(
     task_id='compare_versions',
     python_callable=compare_versions,

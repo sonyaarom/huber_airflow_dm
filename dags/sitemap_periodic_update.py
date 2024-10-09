@@ -1,3 +1,8 @@
+"""
+This DAG is designed to periodically update the sitemap data and trigger the sitemap_update_pipeline.
+It retrieves the sitemap data, processes it, and uploads it to S3. After the upload, it triggers the sitemap_update_pipeline DAG.
+"""
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -6,6 +11,7 @@ from datetime import datetime, timedelta
 import os
 import json
 import logging
+from custom_operators.web_utils import send_telegram_message
 
 # Initialize logger
 logging.basicConfig(level=logging.INFO)
@@ -35,7 +41,16 @@ dag = DAG(
     catchup=False
 )
 
+#Process Sitemap Task (process_sitemap_task)
 def process_sitemap_task(**kwargs):
+    """
+    Processes the sitemap and extracts relevant data.
+
+    This function retrieves the sitemap URL, excludes certain extensions and patterns,
+    includes specific patterns, and allows a base URL. It then processes the sitemap,
+    calculates various counts, and saves the data to a JSON file. 
+    The safety check in there is a check of the base url. It prevents upload from the wrong, potentially harmful sites.
+    """
     from custom_operators.sitemap_processor import process_sitemap
     
     url = 'https://www.wiwi.hu-berlin.de/sitemap.xml.gz'
@@ -60,7 +75,14 @@ def process_sitemap_task(**kwargs):
         json.dump(data_dict, f)
     kwargs['ti'].xcom_push(key='data_file_path', value=data_file_path)
 
+#Upload to S3 Task (upload_to_s3_task)
 def upload_to_s3_task(**kwargs):
+    """
+    Uploads the processed sitemap data to S3.
+
+    This function retrieves the data file path from XCom, generates a dynamic S3 key
+    with the current timestamp, and uploads the file to the specified S3 bucket.
+    """
     ti = kwargs['ti']
     data_file_path = ti.xcom_pull(key='data_file_path', task_ids='process_sitemap')
     
@@ -80,7 +102,7 @@ def upload_to_s3_task(**kwargs):
     # Push the S3 key to XCom for use in the trigger task
     kwargs['ti'].xcom_push(key='s3_key', value=s3_key_prefix)
 
-# Task definitions
+#Tasks
 process_sitemap = PythonOperator(
     task_id='process_sitemap',
     python_callable=process_sitemap_task,
@@ -104,5 +126,5 @@ trigger_update = TriggerDagRunOperator(
     dag=dag,
 )
 
-# Set task dependencies
+#Dependencies
 process_sitemap >> upload_to_s3 >> trigger_update

@@ -1,3 +1,8 @@
+"""
+This DAG is being triggered with the sitemap_update_pipeline DAG.
+This DAG is designed to update Pinecone and S3 storage based on sitemap changes and send notifications.
+"""
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
 from airflow.providers.amazon.aws.hooks.s3 import S3Hook
@@ -48,6 +53,25 @@ dag = DAG(
 
 
 def numpy_to_python(data):
+    """
+    Recursively converts numpy data types to their Python equivalents.
+
+    This function traverses through nested structures (dictionaries and lists) and converts
+    numpy arrays and scalar types to standard Python types. This is useful for ensuring
+    data compatibility, especially when serializing data (e.g., for JSON encoding).
+
+    Args:
+        data: The input data, which can be a dictionary, list, numpy array, numpy scalar, or any other type.
+
+    Returns:
+        The input data with all numpy types converted to standard Python types.
+
+    Examples:
+        >>> import numpy as np
+        >>> data = {'array': np.array([1, 2, 3]), 'scalar': np.float32(2.5)}
+        >>> numpy_to_python(data)
+        {'array': [1, 2, 3], 'scalar': 2.5}
+    """
     if isinstance(data, dict):
         return {key: numpy_to_python(value) for key, value in data.items()}
     elif isinstance(data, list):
@@ -60,8 +84,17 @@ def numpy_to_python(data):
         return data
 
 
-# Helper functions
 def combine_added_and_modified_data(data: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Combines 'added' and 'modified' data from a dictionary.
+
+    This function takes a dictionary containing 'added' and 'modified' keys,
+    each with a list of items. It combines these lists into a single list,
+    ensuring no duplicate entries.
+
+    Args:
+        data: A dictionary containing 'added' and 'modified' keys.
+    """
     if not isinstance(data, dict):
         raise TypeError("Input must be a dictionary")
 
@@ -77,10 +110,21 @@ def combine_added_and_modified_data(data: Dict[str, Any]) -> Dict[str, Any]:
 
     return combined_data
 
+
 def find_all_matching_unique_ids(unique_id_list, id_list):
     return [unique_id for unique_id in unique_id_list if any(unique_id.startswith(id) for id in id_list)]
 
+
 def send_telegram_message(message):
+    """
+    Sends a message to a Telegram chat using the Telegram Bot API.
+
+    This function sends a message to a specified chat using the Telegram Bot API.
+    It handles the API request and error handling.
+
+    Args:
+        message: The message to be sent.
+    """
     from requests.exceptions import RequestException
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.warning("Telegram credentials not set. Skipping Telegram notification.")
@@ -101,8 +145,18 @@ def send_telegram_message(message):
     except Exception as e:
         logger.error(f"Unexpected error when sending Telegram message: {str(e)}")
 
-# Task functions
+# Part 1: Deleting old and modified data
+#Retrieve Trigger Data Task (retrieve_trigger_data_task)
 def retrieve_trigger_data(**kwargs):
+    """
+    Retrieves trigger data from S3 based on the provided S3 key.
+
+    This function reads the trigger data from an S3 bucket using the provided S3 key.
+    It then loads the trigger data as a JSON object and returns it.
+
+    Args:
+        kwargs: Additional keyword arguments, including 'dag_run' which contains the DAG run configuration.
+    """
     trigger_file_s3_key = kwargs['dag_run'].conf.get('trigger_file_s3_key')
     if not trigger_file_s3_key:
         raise ValueError("No trigger file S3 key provided")
@@ -118,15 +172,29 @@ def retrieve_trigger_data(**kwargs):
     
     return {'updated_ids': list(updated_ids), 'changes': changes}
 
-
+#Get Unique IDs Task (get_unique_ids_task)
 def get_unique_ids():
+    """
+    Retrieves unique IDs from S3 based on the provided S3 key.
+
+    This function reads the unique IDs data from an S3 bucket using the provided S3 key.
+    It then loads the unique IDs data as a JSON object and returns it.
+    """
     s3_hook = S3Hook(aws_conn_id='aws_default')
     unique_ids_data = s3_hook.read_key(UNIQUE_IDS_KEY, BUCKET_NAME)
     return json.loads(unique_ids_data)
 
-### PART 1: deleting old  and modified data
-
+#Process Ids for Deletion Task (process_ids_task)
 def process_ids_for_deletion(**kwargs):
+    """
+    Processes IDs for deletion from Pinecone and related data.
+
+    This function retrieves the necessary data from XCom and performs the following steps:
+    1. Retrieves trigger data and unique IDs.
+    2. Finds all matching unique IDs between the trigger data and the unique IDs.
+    3. Deletes the matching IDs from Pinecone.
+    4. Removes the matching IDs from embeddings and enriched data.
+    """
     import pandas as pd
     from io import StringIO
     from custom_operators.pinecone_func import get_pinecone_credentials, initialize_pinecone
@@ -160,18 +228,22 @@ def process_ids_for_deletion(**kwargs):
     logger.info(f"Processed deletion for {successful_deletions} out of {len(ids_to_delete)} IDs from Pinecone")
 
     s3_hook = S3Hook(aws_conn_id='aws_default')
-    BUCKET = 'huber-chatbot-project'
-    EMBEDDINGS_PREFIX = 'embeddings/'
-    ENRICHED_PREFIX = 'enriched_data/'
 
     def remove_unique_ids_from_embeddings(unique_ids_to_remove):
+        """
+        Removes unique IDs from embeddings files in S3.
+
+        This function reads the embeddings files from S3, removes the specified unique IDs,
+        and updates the files with the remaining data. It also logs the removed IDs and the
+        number of items removed from each file.
+        """
         deleted_unique_ids = []
         try:
-            keys = s3_hook.list_keys(bucket_name=BUCKET, prefix=EMBEDDINGS_PREFIX)
+            keys = s3_hook.list_keys(bucket_name=BUCKET_NAME, prefix=EMBEDDINGS_PREFIX)
             for key in keys:
                 if key.endswith('.json'):
                     try:
-                        file_content = s3_hook.read_key(key, bucket_name=BUCKET)
+                        file_content = s3_hook.read_key(key, bucket_name=BUCKET_NAME)
                         enriched_data = json.loads(file_content)
                         
                         original_length = len(enriched_data)
@@ -179,7 +251,7 @@ def process_ids_for_deletion(**kwargs):
                         removed_count = original_length - len(new_enriched_data)
                         
                         if removed_count > 0:
-                            s3_hook.load_string(json.dumps(new_enriched_data), key, bucket_name=BUCKET, replace=True)
+                            s3_hook.load_string(json.dumps(new_enriched_data), key, bucket_name=BUCKET_NAME, replace=True)
                             logger.info(f"Updated embeddings file {key}, removed {removed_count} items")
                             
                             removed_ids = [item['unique_id'] for item in enriched_data if item.get('unique_id') in unique_ids_to_remove]
@@ -195,13 +267,20 @@ def process_ids_for_deletion(**kwargs):
         return deleted_unique_ids
 
     def remove_modified_ids_from_enriched(unique_ids_to_remove):
+        """
+        Removes modified IDs from enriched data files in S3.
+
+        This function reads the enriched data files from S3, removes the specified unique IDs,
+        and updates the files with the remaining data. It also logs the removed IDs and the
+        number of items removed from each file.
+        """
         total_removed = 0
         try:
-            keys = s3_hook.list_keys(bucket_name=BUCKET, prefix=ENRICHED_PREFIX)
+            keys = s3_hook.list_keys(bucket_name=BUCKET_NAME, prefix=ENRICHED_DATA_PREFIX)
             for key in keys:
                 if key.endswith('.csv'):
                     try:
-                        file_content = s3_hook.read_key(key, bucket_name=BUCKET)
+                        file_content = s3_hook.read_key(key, bucket_name=BUCKET_NAME)
                         enriched_data = pd.read_csv(StringIO(file_content))
 
                         original_length = len(enriched_data)
@@ -211,7 +290,7 @@ def process_ids_for_deletion(**kwargs):
                         if removed_count > 0:
                             csv_buffer = StringIO()
                             enriched_data.to_csv(csv_buffer, index=False)
-                            s3_hook.load_string(csv_buffer.getvalue(), key, bucket_name=BUCKET, replace=True)
+                            s3_hook.load_string(csv_buffer.getvalue(), key, bucket_name=BUCKET_NAME, replace=True)
                             logger.info(f"Updated enriched file {key}, removed {removed_count} items")
                             total_removed += removed_count
 
@@ -222,19 +301,26 @@ def process_ids_for_deletion(**kwargs):
         logger.info(f"Total items removed from enriched data across all files: {total_removed}")
 
     def update_unique_ids_list(unique_ids_to_remove):
+        """
+        Updates the unique IDs list in S3 by removing specified IDs.
+
+        This function reads the unique IDs files from S3, removes the specified unique IDs,
+        and updates the files with the remaining data. It also logs the removed IDs and the
+        number of items removed from each file.
+        """
         total_removed_uid = 0
         try:
-            keys = s3_hook.list_keys(bucket_name=BUCKET, prefix=UNIQUE_IDS_PREFIX)
+            keys = s3_hook.list_keys(bucket_name=BUCKET_NAME, prefix=UNIQUE_IDS_PREFIX)
             for key in keys:
                 if key.endswith('.json'):
                     try:
-                        file_content = s3_hook.read_key(key, bucket_name=BUCKET)
+                        file_content = s3_hook.read_key(key, bucket_name=BUCKET_NAME)
                         unique_ids = json.loads(file_content)
                         original_length = len(unique_ids)
                         unique_ids = [uid for uid in unique_ids if uid not in unique_ids_to_remove]
                         removed_count = original_length - len(unique_ids)
                         if removed_count > 0:
-                            s3_hook.load_string(json.dumps(unique_ids), key, bucket_name=BUCKET, replace=True)
+                            s3_hook.load_string(json.dumps(unique_ids), key, bucket_name=BUCKET_NAME, replace=True)
                             logger.info(f"Updated unique IDs list {key}, removed {removed_count} items")
                             total_removed_uid += removed_count
                     except Exception as e:
@@ -263,6 +349,12 @@ def process_ids_for_deletion(**kwargs):
 
 
 def process_and_notify(**kwargs):
+    """
+    Processes deletion results and sends a notification via Telegram.
+
+    This function retrieves the deletion results from XCom, constructs a message,
+    and sends it to a Telegram chat using the Telegram Bot API.
+    """
     ti = kwargs['ti']
     deletion_results = ti.xcom_pull(task_ids='process_ids_for_deletion')
     
@@ -281,11 +373,16 @@ def process_and_notify(**kwargs):
     logger.info(f"Processed deletions and sent Telegram notification.")
 
 
-###PART2: uploading new data
-#task that checks trigger fil;e and combines modified and added entries
+#Part 2: Uploading new data
 
-
+#Combine Added and Modified Data Task (combine_added_and_modified_data_task)
 def combine_added_and_modified_data(**kwargs):
+    """
+    Combines added and modified data from trigger data.
+
+    This function retrieves the trigger data from XCom, extracts the 'added' and 'modified' data,
+    and combines them into a single dictionary.
+    """
     ti = kwargs['ti']
     trigger_data = ti.xcom_pull(task_ids='retrieve_trigger_data')
     changes = trigger_data['changes']
@@ -303,6 +400,12 @@ def combine_added_and_modified_data(**kwargs):
     return combined_data
 
 def enrich_data(**kwargs):
+    """
+    Enriches the combined data with additional information and saves it to S3.
+
+    This function takes the combined data, adds HTML content, extracts content, and combines it with existing data.
+    It then saves the enriched data to S3 and prepares the new data for the next task.
+    """
     import pandas as pd
     from io import StringIO
     from custom_operators.web_utils import add_html_content_to_df
@@ -407,7 +510,16 @@ def enrich_data(**kwargs):
         'num_new_items': len(df_new)
     }
 
+#Recursive Chunking and Embedding Task (recursive_chunking_and_embedding_task)
 def recursive_chunking_and_embedding_task(**kwargs):
+    """
+    Performs recursive chunking and embedding of the enriched data.
+
+    This function takes the enriched data file path, reads the data, and performs the following steps:
+    1. Chunks the data using RecursiveCharacterTextSplitter.
+    2. Embeds the chunks using SentenceTransformer.
+    3. Saves the embeddings to JSON files.
+    """
     import pandas as pd
     import numpy as np
     import gc
@@ -570,9 +682,14 @@ def recursive_chunking_and_embedding_task(**kwargs):
     # Optionally, return the chunk statistics
     return chunk_stats
 
-#right now it handles only unique ids, but should also update embeddings and enriched data
-
+#Update Storage Task (update_storage_task)
 def update_storage(**kwargs):
+    """
+    Updates the Pinecone index with new embeddings and manages unique IDs.
+
+    This function retrieves the new documents from XCom, updates the Pinecone index,
+    and updates the unique IDs list in S3.
+    """
     from custom_operators.pinecone_func import get_pinecone_credentials, initialize_pinecone, upload_to_pinecone
     ti = kwargs['ti']
     embedding_results = ti.xcom_pull(task_ids='embed_and_update_s3')
@@ -667,7 +784,14 @@ def update_storage(**kwargs):
         'num_unique_ids': len(updated_unique_ids)
     }
 
+#Final Notification Task (final_notification_task)
 def final_notification(**kwargs):
+    """
+    Processes deletion results and sends a notification via Telegram.
+
+    This function retrieves the deletion results from XCom, constructs a message,
+    and sends it to a Telegram chat using the Telegram Bot API.
+    """
     ti = kwargs['ti']
     deletion_results = ti.xcom_pull(task_ids='process_ids_for_deletion')
     update_results = ti.xcom_pull(task_ids='update_storage')
@@ -699,7 +823,14 @@ class NumpyEncoder(json.JSONEncoder):
             return float(obj)
         return super(NumpyEncoder, self).default(obj)
 
+#Embed and Update S3 Task (embed_and_update_s3_task)
 def embed_and_update_s3(**kwargs):
+    """
+    Embeds the new enriched data and updates the embeddings file in S3.
+
+    This function reads the new enriched data from S3, performs chunking, embedding,
+    and updates the embeddings file with the new data. It also handles BM25 sparse vectorization.
+    """
     import pandas as pd
     from io import StringIO
     from sentence_transformers import SentenceTransformer
@@ -841,7 +972,15 @@ def embed_and_update_s3(**kwargs):
         'num_new_embeddings': len(new_documents)
     }
 
+#Move Trigger File Task (move_trigger_file_task)
 def move_trigger_file(**kwargs):
+    """
+    Moves the trigger file to a processed location in S3.
+
+    This function retrieves the trigger file S3 key from the DAG run configuration,
+    generates a new key for the processed trigger file, and copies the file to the new location.
+    It also deletes the original trigger file from S3.
+    """
     from datetime import datetime
     
     ti = kwargs['ti']
@@ -878,6 +1017,7 @@ def move_trigger_file(**kwargs):
     
     return {"processed_trigger_file": new_key}
 
+#Tasks
 retrieve_trigger_data_task = PythonOperator(
     task_id='retrieve_trigger_data',
     python_callable=retrieve_trigger_data,

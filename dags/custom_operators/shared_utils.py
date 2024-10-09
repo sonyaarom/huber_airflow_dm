@@ -481,4 +481,38 @@ def upload_to_pinecone(documents, pc, embedding_model_name, api_key, environment
 
 
 def get_overlap(chunk_size: int) -> int:
+    """
+    Calculates the overlap based on the chunk size.
+
+    Args:
+        chunk_size (int): The chunk size used in chunking.
+
+    Returns:
+        int: The overlap value.
+    """
     return 50 if chunk_size <= 256 else 200
+
+
+
+def numpy_to_python(data):
+    """
+    Converts NumPy objects to Python objects.
+
+    Args:
+        data: The data to convert.
+
+    Returns:
+        The converted data.
+    """
+    if isinstance(data, dict):
+        return {key: numpy_to_python(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [numpy_to_python(element) for element in data]
+    elif isinstance(data, np.ndarray):
+        return data.tolist()
+    elif isinstance(data, np.generic):  # For scalar numpy types
+        return data.item()
+    else:
+        return data
+
+

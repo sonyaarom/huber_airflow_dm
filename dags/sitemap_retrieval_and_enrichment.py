@@ -1,13 +1,31 @@
+"""
+This DAG is responsible for the initial retrieval of the sitemap data, then enriching it with additional information,
+and preparing it for further processing. It's a crucial part of the content indexing pipeline,
+enabling efficient retrieval and updating of website content for the chatbot system.
+
+The DAG performs the following key tasks:
+1. Retrieves sitemap data from a specified URL
+2. Processes and filters the sitemap entries
+3. Enriches the data with additional content and metadata
+4. Prepares the enriched data for embedding and indexing
+5. Uploads the processed data to S3 for storage and further use
+
+This automated process ensures that the chatbot's knowledge base stays up-to-date
+with the latest content from the website, improving the accuracy and relevance of its responses.
+
+Please note that this DAG is designed to be triggered manually, and it's not intended to run on a schedule.
+This DAG is designed to be the first step in the data management pipeline.
+"""
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.models import Variable
-from airflow.hooks.base import BaseHook
+from airflow.models import Variable 
+from airflow.hooks.base import BaseHook 
 from datetime import datetime, timedelta
 import os
 import json
 import logging
 import shutil
-from airflow.hooks.S3_hook import S3Hook
 
 # Initialize logger
 logging.basicConfig(level=logging.INFO)
@@ -15,17 +33,18 @@ logger = logging.getLogger(__name__)
 
 # Constants
 BUCKET_NAME = 'huber-chatbot-project'
+SITEMAP_DATA_DIR = '/opt/airflow/dags/data'
 S3_KEY_PREFIX = f'sitemap_data/sitemap_data_{datetime.now().strftime("%Y")}.json'
 ENRICHED_DATA_S3_PREFIX = f'enriched_data/enriched_data_{datetime.now().strftime("%Y")}.csv'
 EMBEDDINGS_S3_PREFIX = 'embeddings/'
 BM25_S3_PREFIX = 'bm25/'
-UNIQUE_IDS_S3_PREFIX = 'unique_ids/'
-
-LOCAL_DATA_DIR = '/opt/airflow/dags/data'
 ENRICHED_DATA_DIR = '/opt/airflow/dags/enriched'
 EMBEDDINGS_DIR = '/opt/airflow/dags/embeddings'
 BM25_DIR = '/opt/airflow/dags/bm25'
+UNIQUE_IDS_S3_PREFIX = 'unique_ids/'
 UNIQUE_IDS_DIR = '/opt/airflow/dags/unique_ids'
+
+
 
 # Airflow default arguments
 default_args = {
@@ -40,58 +59,134 @@ default_args = {
 
 # DAG definition
 dag = DAG(
-    'test_dag',
+    'sitemap_retrieval_and_enrichment',
     default_args=default_args,
-    description='A DAG for processing existing S3 data, enriching, and uploading to Pinecone',
+    description='A DAG for retrieving sitemaps and enriching data',
     schedule_interval=None,
     catchup=False
 )
 
-def check_s3_data_task(**kwargs):
-    s3_hook = S3Hook(aws_conn_id='aws_default')
-    if not s3_hook.check_for_key(S3_KEY_PREFIX, bucket_name=BUCKET_NAME):
-        raise FileNotFoundError(f"No data found in S3 at {S3_KEY_PREFIX}")
-    
-    data = s3_hook.read_key(S3_KEY_PREFIX, bucket_name=BUCKET_NAME)
-    data_dict = json.loads(data)
-    
-    os.makedirs(LOCAL_DATA_DIR, exist_ok=True)
-    local_file_path = os.path.join(LOCAL_DATA_DIR, 'sitemap_data.json')
-    with open(local_file_path, 'w') as f:
+
+#Process Sitemap Task (process_sitemap_task)
+def process_sitemap_task(**kwargs):
+    """
+    Processes the sitemap and extracts relevant data.
+
+    This function retrieves the sitemap URL, excludes certain extensions and patterns,
+    includes specific patterns, and allows a base URL. It then processes the sitemap,
+    calculates various counts, and saves the data to a JSON file.
+    """
+    from custom_operators.sitemap_processor import process_sitemap
+
+    url = 'https://www.wiwi.hu-berlin.de/sitemap.xml.gz'
+    exclude_extensions = ['.jpg', '.pdf', '.jpeg', '.png']
+    exclude_patterns = ['view']
+    include_patterns = ['/en/']
+    allowed_base_url = 'https://www.wiwi.hu-berlin.de'
+
+    data_dict, total, filtered, safe, unsafe = process_sitemap(
+        url, exclude_extensions, exclude_patterns, include_patterns, allowed_base_url
+    )
+
+    logger.info(f"Total entries: {total}")
+    logger.info(f"Filtered entries: {filtered}")
+    logger.info(f"Safe entries: {safe}")
+    logger.info(f"Unsafe entries: {unsafe}")
+
+    # Save the data_dict to a JSON file and pass the file path
+    os.makedirs(SITEMAP_DATA_DIR, exist_ok=True)
+    data_file_path = os.path.join(SITEMAP_DATA_DIR, 'sitemap_data.json')
+    with open(data_file_path, 'w') as f:
         json.dump(data_dict, f)
-    
-    kwargs['ti'].xcom_push(key='data_file_path', value=local_file_path)
-    logger.info(f"Data retrieved from S3 and saved locally at: {local_file_path}")
+    kwargs['ti'].xcom_push(key='data_file_path', value=data_file_path)
 
-def enrich_data_task(**kwargs):
-    import pandas as pd
+
+#Upload to S3 Task (upload_to_s3_task)
+def upload_to_s3_task(**kwargs):
+    """
+    Uploads the processed sitemap data to S3.
+
+    This function retrieves the data file path from XCom, generates a dynamic S3 key
+    with the current timestamp, and uploads the file to the specified S3 bucket.
+    """
+    from airflow.hooks.S3_hook import S3Hook
     ti = kwargs['ti']
-    data_file_path = ti.xcom_pull(key='data_file_path', task_ids='check_s3_data')
+    data_file_path = ti.xcom_pull(key='data_file_path', task_ids='process_sitemap')
 
+    s3_hook = S3Hook(aws_conn_id='aws_default')
+    s3_hook.load_file(
+        filename=data_file_path,
+        key=S3_KEY_PREFIX,
+        bucket_name=BUCKET_NAME,
+        replace=True
+    )
+    logger.info(f"Data uploaded to S3 bucket: {BUCKET_NAME}")
+    logger.info(f"S3 key: {S3_KEY_PREFIX}")
+
+
+#Enrich Data Task (enrich_data_task)
+def enrich_data_task(**kwargs):
+    """
+    Enriches the sitemap data with additional content and metadata.
+
+    This function reads the processed sitemap data from S3, converts it to a DataFrame,
+    and adds HTML content and extracted content to the DataFrame. It then processes the data,
+    filters out certain entries, and saves the enriched data locally.
+    """
+    import pandas as pd 
+    ti = kwargs['ti']
+    data_file_path = ti.xcom_pull(key='data_file_path', task_ids='process_sitemap')
+
+    # Load the data
     with open(data_file_path, 'r') as f:
         data_dict = json.load(f)
 
+    # Process the data
     df = pd.DataFrame.from_dict(data_dict, orient='index').reset_index()
     df.columns = ['id', 'url', 'last_updated']
 
+    df = df.head(10)
+
+    # Import inside the function
     from custom_operators.web_utils import add_html_content_to_df
     from custom_operators.content_extractor import add_extracted_content_to_df
 
+    # Add HTML content to the DataFrame
     df = add_html_content_to_df(df)
+
+    # Log number of None html_content entries
+    num_none_html = df['html_content'].isnull().sum()
+    logger.info(f"Number of entries with None html_content: {num_none_html}")
+
+    # Extract and add content to the DataFrame
     df = add_extracted_content_to_df(df)
+
+    # Optionally, drop rows with missing extracted content
     df = df[df['extracted_content'] != "Title not found Main content not found"]
 
+    # Save enriched data locally
     os.makedirs(ENRICHED_DATA_DIR, exist_ok=True)
-    enriched_file_path = os.path.join(ENRICHED_DATA_DIR, f'enriched_data_{datetime.now().strftime("%Y")}.csv')
+    enriched_file_path = os.path.join(
+        ENRICHED_DATA_DIR, f'enriched_data_{datetime.now().strftime("%Y")}.csv')
     df.to_csv(enriched_file_path, index=False)
     logger.info(f"Enriched data saved to: {enriched_file_path}")
+    #push the enriched file path to xcom
+    ti = kwargs['ti']
     ti.xcom_push(key='enriched_file_path', value=enriched_file_path)
 
+#Upload Enriched Data to S3 Task (upload_enriched_data_to_s3_task)
 def upload_enriched_data_to_s3_task(**kwargs):
-    s3_hook = S3Hook(aws_conn_id='aws_default')
+    """
+    Uploads the enriched data to S3.
+
+    This function retrieves the enriched data file path from XCom, generates a dynamic S3 key
+    with the current timestamp, and uploads the file to the specified S3 bucket.
+    """
+    from airflow.hooks.S3_hook import S3Hook
     ti = kwargs['ti']
     enriched_file_path = ti.xcom_pull(key='enriched_file_path', task_ids='enrich_data')
 
+    s3_hook = S3Hook(aws_conn_id='aws_default')
     s3_hook.load_file(
         filename=enriched_file_path,
         key=ENRICHED_DATA_S3_PREFIX,
@@ -100,9 +195,16 @@ def upload_enriched_data_to_s3_task(**kwargs):
     )
     logger.info(f"Enriched data uploaded to S3 bucket: {BUCKET_NAME}")
     logger.info(f"S3 key: {ENRICHED_DATA_S3_PREFIX}")
+    
 
-
+#Recursive Chunking and Embedding Task (recursive_chunking_and_embedding_task)
 def recursive_chunking_and_embedding_task(**kwargs):
+    """
+    Performs recursive chunking and embedding of the enriched data.
+
+    This function reads the enriched data from S3, performs chunking, embedding,
+    and saves the embeddings to JSON files locally. It also handles BM25 sparse vectorization.
+    """
     import pandas as pd
     import numpy as np
     import os
@@ -119,7 +221,8 @@ def recursive_chunking_and_embedding_task(**kwargs):
         embed_dataframe,
         generate_documents,
         save_documents_to_json,
-        create_and_save_bm25_corpus
+        create_and_save_bm25_corpus,
+        get_overlap
     )
 
     # Retrieve the task instance to use XCom
@@ -265,7 +368,14 @@ def recursive_chunking_and_embedding_task(**kwargs):
     # Optionally, return the chunk statistics
     return chunk_stats
 
+#Upload Embeddings to S3 Task (upload_embeddings_to_s3_task)
 def upload_embeddings_to_s3_task(**kwargs):
+    """
+    Uploads the embeddings to S3.
+
+    This function retrieves the embeddings file paths from XCom, generates a dynamic S3 key
+    with the current timestamp, and uploads the files to the specified S3 bucket.
+    """
     from airflow.hooks.S3_hook import S3Hook
     ti = kwargs['ti']
     embeddings_file_paths = ti.xcom_pull(key='embeddings_file_paths', task_ids='recursive_chunking_and_embedding')
@@ -283,7 +393,14 @@ def upload_embeddings_to_s3_task(**kwargs):
         logger.info(f"Embeddings file uploaded to S3 bucket: {BUCKET_NAME}")
         logger.info(f"S3 key: {s3_key}")
 
+#Upload BM25 to S3 Task (upload_bm25_to_s3_task)
 def upload_bm25_to_s3_task(**kwargs):
+    """
+    Uploads the BM25 values to S3.
+
+    This function retrieves the BM25 file path from XCom, generates a dynamic S3 key
+    with the current timestamp, and uploads the file to the specified S3 bucket.
+    """
     from airflow.hooks.S3_hook import S3Hook
     bm25_file_path = os.path.join(BM25_DIR, 'bm25_values.json')
 
@@ -298,12 +415,15 @@ def upload_bm25_to_s3_task(**kwargs):
     logger.info(f"BM25 file uploaded to S3 bucket: {BUCKET_NAME}")
     logger.info(f"S3 key: {s3_key}")
 
-
-def get_overlap(chunk_size: int) -> int:
-    return 50 if chunk_size <= 256 else 200
-
-
+#Upload to Pinecone Task (upload_to_pinecone_task)
 def upload_to_pinecone_task(**kwargs):
+    """
+    Uploads the embeddings to Pinecone.
+
+    This function retrieves the embeddings file paths from XCom, loads the embeddings data,
+    prepares the documents for upload, and uploads them to Pinecone. It uploads to already existing index.
+    Please, make sure that the index exists before running this task.
+    """
     from custom_operators.pinecone_func import upload_to_pinecone, get_pinecone_credentials, initialize_pinecone
     ti = kwargs['ti']
     embeddings_file_paths = ti.xcom_pull(key='embeddings_file_paths', task_ids='recursive_chunking_and_embedding')
@@ -358,8 +478,14 @@ def upload_to_pinecone_task(**kwargs):
 
     logger.info("All uploads completed successfully")
 
+#Extract and Upload Unique IDs Task (extract_and_upload_unique_ids_task)
 def extract_and_upload_unique_ids_task(**kwargs):
-    """Extract unique IDs from embedding files and upload to S3."""
+    """
+    Extracts unique IDs from embedding files and uploads to S3.
+
+    This function retrieves the embeddings file paths from XCom, extracts unique IDs from the embeddings,
+    and uploads them to S3. It ensures the uniqueness of the IDs and saves them locally before uploading.
+    """
     from airflow.hooks.S3_hook import S3Hook
     ti = kwargs['ti']
     embeddings_file_paths = ti.xcom_pull(key='embeddings_file_paths', task_ids='recursive_chunking_and_embedding')
@@ -396,9 +522,16 @@ def extract_and_upload_unique_ids_task(**kwargs):
     os.remove(unique_ids_file_path)
     logger.info(f"Deleted local unique IDs file: {unique_ids_file_path}")
 
-
+#Cleanup Local Files Task (cleanup_local_files_task)
 def cleanup_local_files_task(**kwargs):
-    directories_to_clean = [LOCAL_DATA_DIR, ENRICHED_DATA_DIR, EMBEDDINGS_DIR, BM25_DIR, UNIQUE_IDS_DIR]
+    """
+    Deletes locally stored BM25, embeddings, and enriched files after S3 upload.
+
+    This function removes the directories containing the processed sitemap data,
+    enriched data, embeddings, and BM25 values. It ensures that all temporary files
+    and directories are deleted after the data has been successfully uploaded to S3.
+    """
+    directories_to_clean = [SITEMAP_DATA_DIR, ENRICHED_DATA_DIR, EMBEDDINGS_DIR, BM25_DIR, UNIQUE_IDS_DIR]
     
     for directory in directories_to_clean:
         if os.path.exists(directory):
@@ -407,69 +540,76 @@ def cleanup_local_files_task(**kwargs):
         else:
             logger.info(f"Directory does not exist: {directory}")
 
-# Define the tasks
+
+#Tasks
 t1 = PythonOperator(
-    task_id='check_s3_data',
-    python_callable=check_s3_data_task,
+    task_id='process_sitemap',
+    python_callable=process_sitemap_task,
     provide_context=True,
     dag=dag,
 )
 
 t2 = PythonOperator(
+    task_id='upload_to_s3',
+    python_callable=upload_to_s3_task,
+    provide_context=True,
+    dag=dag,
+)
+
+t3 = PythonOperator(
     task_id='enrich_data',
     python_callable=enrich_data_task,
     provide_context=True,
     dag=dag,
 )
 
-t3 = PythonOperator(
+t4 = PythonOperator(
     task_id='upload_enriched_data_to_s3',
     python_callable=upload_enriched_data_to_s3_task,
     provide_context=True,
     dag=dag,
 )
 
-t4 = PythonOperator(
+t5 = PythonOperator(
     task_id='recursive_chunking_and_embedding',
     python_callable=recursive_chunking_and_embedding_task,
     provide_context=True,
     dag=dag,
 )
 
-t5 = PythonOperator(
+t6 = PythonOperator(
     task_id='upload_embeddings_to_s3',
     python_callable=upload_embeddings_to_s3_task,
     provide_context=True,
     dag=dag,
 )
 
-t6 = PythonOperator(
+t7 = PythonOperator(
     task_id='upload_bm25_to_s3',
     python_callable=upload_bm25_to_s3_task,
     provide_context=True,
     dag=dag,
 )
 
-t7 = PythonOperator(
+t8 = PythonOperator(
     task_id='upload_to_pinecone',
     python_callable=upload_to_pinecone_task,
     provide_context=True,
     dag=dag,
 )
 
-t8 = PythonOperator(
+t9 = PythonOperator(
     task_id='extract_and_upload_unique_ids',
     python_callable=extract_and_upload_unique_ids_task,
     provide_context=True,
     dag=dag,
 )
 
-t9 = PythonOperator(
+t10 = PythonOperator(
     task_id='cleanup_local_files',
     python_callable=cleanup_local_files_task,
     provide_context=True,
     dag=dag,
 )
-
 # Set the task dependencies
-t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8 >> t9
+t1 >> t2 >> t3 >> t4 >> t5 >> t6 >> t7 >> t8 >> t9 >> t10

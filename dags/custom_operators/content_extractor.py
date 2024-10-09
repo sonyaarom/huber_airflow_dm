@@ -6,6 +6,15 @@ import logging
 logger = logging.getLogger(__name__)
 
 def extract_info(html_content):
+    """
+    Extracts title and content from HTML content.
+
+    Args:
+        html_content (str): The HTML content to extract information from.
+
+    Returns:
+        dict: A dictionary containing the title and content.
+    """
     if not html_content:
         # Handle None or empty html_content
         return {
@@ -42,6 +51,15 @@ def extract_info(html_content):
     }
 
 def add_extracted_content_to_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Adds extracted content to the DataFrame.
+
+    Args:
+        df (pd.DataFrame): The DataFrame containing HTML content.
+
+    Returns:
+        pd.DataFrame: The DataFrame with extracted content.
+    """
     extracted_data = df['html_content'].apply(extract_info)
     
     df['extracted_title'] = extracted_data.apply(lambda x: x['title'])
@@ -50,6 +68,14 @@ def add_extracted_content_to_df(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 def combine_files(df_new, df_existing, id_column):
+    """
+    Combines two DataFrames and updates or appends new data.
+
+    Args:
+        df_new (pd.DataFrame): The new DataFrame to combine.
+        df_existing (pd.DataFrame): The existing DataFrame to update.
+        id_column (str): The column to use for identifying rows.
+    """
     logger.info(f"Combining files. New data shape: {df_new.shape}, Existing data shape: {df_existing.shape}")
 
     # Convert id column to string in both dataframes
