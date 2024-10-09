@@ -370,8 +370,8 @@ def enrich_data(**kwargs):
                 logger.warning(f"Columns with NaN: {df_combined.columns[df_combined.isna().any()].tolist()}")
                 
                 # Fill NaN values with a placeholder or drop rows with NaN
-                df_combined = df_combined.dropna(subset=['html_content', 'extracted_content']) # or use df_combined.dropna() if you prefer to drop rows
-                logger.info("Filled NaN values with 'N/A'")
+                df_combined = df_combined.dropna(subset=['html_content', 'extracted_content'])
+                logger.info(f"Rows after dropping NaN: {len(df_combined)}")
 
     except Exception as e:
         logger.error(f"Error processing existing file: {str(e)}")
@@ -406,7 +406,6 @@ def enrich_data(**kwargs):
         'num_enriched_items': len(df_combined),
         'num_new_items': len(df_new)
     }
-
 
 def recursive_chunking_and_embedding_task(**kwargs):
     import pandas as pd
@@ -941,10 +940,10 @@ move_trigger_file_task = PythonOperator(
     dag=dag,
 )
 
-
-#Dependencies
+# Dependencies
 retrieve_trigger_data_task >> [get_unique_ids_task, combine_data_task]
 get_unique_ids_task >> process_ids_task
-combine_data_task >> enrich_data_task >> embed_and_update_s3_task >> update_storage_task
+[process_ids_task, combine_data_task] >> enrich_data_task
+enrich_data_task >> embed_and_update_s3_task >> update_storage_task
 [process_ids_task, update_storage_task] >> final_notification_task
 final_notification_task >> move_trigger_file_task
