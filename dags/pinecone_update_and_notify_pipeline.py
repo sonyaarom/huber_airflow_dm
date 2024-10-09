@@ -546,8 +546,8 @@ def recursive_chunking_and_embedding_task(**kwargs):
 
     # Read the DataFrame from the CSV file
     df = pd.read_csv(enriched_file_path)
-    #remove!
-    df = df.head(15)
+
+    #df = df.head(15) #was added for representation purposes
 
     # Initialize models inside the function
     embed_model = SentenceTransformer('all-MiniLM-L6-v2', trust_remote_code=True)

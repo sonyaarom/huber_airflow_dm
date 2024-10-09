@@ -145,7 +145,7 @@ def enrich_data_task(**kwargs):
     df = pd.DataFrame.from_dict(data_dict, orient='index').reset_index()
     df.columns = ['id', 'url', 'last_updated']
 
-    df = df.head(10)
+    #df = df.head(10) #was added for representation purposes
 
     # Import inside the function
     from custom_operators.web_utils import add_html_content_to_df
