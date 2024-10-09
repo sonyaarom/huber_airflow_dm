@@ -107,7 +107,7 @@ flowchart TD
 1. `sitemap_periodic_update.py` is set to trigger every two weeks.
 2. When triggered, it initiates the `sitemap_retrieval_and_enrichment.py` DAG.
 3. `sitemap_retrieval_and_enrichment.py` processes the sitemap data and uploads it to S3 storage.
-4. It then triggers the s`itemap_update_pipeline.py` DAG.
+4. It then triggers the `sitemap_update_pipeline.py` DAG.
 5. `sitemap_update_pipeline.py` checks for changes in the S3 storage.
 6. If changes are detected, it triggers the `pinecone_update_and_notify_pipeline.py` DAG.
 7. `pinecone_update_and_notify_pipeline.py` updates both the S3 storage and the Pinecone index with the new data.
